@@ -7,8 +7,11 @@ seules les *nouvelles* tâches vont à Codex. Une tâche déjà lancée n'est ja
 interrompue. Les erreurs de la sonde (notamment HTTP 429) ne rendent jamais
 Claude indisponible.
 
-Le journal JSONL est volontairement neutre : il sert à construire une capsule
-de relais courte plutôt qu'à partager une session propriétaire entre les CLIs.
+Continuité du contexte : chaque moteur garde sa propre session native (Claude
+via ``--resume``, Codex via ``codex exec resume``), donc tant qu'on reste sur le
+même moteur rien n'est réinjecté. Au *changement* de moteur seulement, le
+journal JSONL est condensé en un fichier de passation (``state/handoff.md``)
+passé en paramètre au démarrage de la session entrante — dans les deux sens.
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -26,12 +30,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import handoff as handoff_builder  # noqa: E402  (dépend du chemin ci-dessus)
+
 BASE = "/opt/tg-claude"
 STATE_DIR = os.path.join(BASE, "state")
 SETTINGS = os.path.join(BASE, "settings.json")
 OFFSET_FILE = os.path.join(STATE_DIR, "offset")
 LOG = os.path.join(BASE, "logs", "bot.log")
 JOURNAL = os.path.join(STATE_DIR, "relay-journal.jsonl")
+HANDOFF_FILE = os.path.join(STATE_DIR, "handoff.md")
+CODEX_LAST_MESSAGE = os.path.join(STATE_DIR, "codex-last-message.txt")
 REPOS_BASE = "/root/repos"
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -47,12 +56,18 @@ ALLOWED_TOOLS = [
 ]
 CLAUDE_TIMEOUT = 1800
 CODEX_TIMEOUT = 1800
-USAGE_POLL_SECONDS = 30
-USAGE_SNAPSHOT_MAX_AGE = 600
+# Relecture du snapshot local (aucun appel réseau). La sonde Anthropic, elle,
+# tourne dans claude-usage-monitor : c'est elle qui doit rester espacée.
+USAGE_POLL_SECONDS = 120
+USAGE_SNAPSHOT_MAX_AGE = 900
 CLAUDE_LIMIT_PERCENT = 98.0
 CLAUDE_RECOVERED_PERCENT = 5.0
-RECENT_EXCHANGES = 8
+CODEX_RETRY_SECONDS = 3600
+# Le fichier de passation ne sert qu'au changement de moteur : on peut y mettre
+# bien plus que l'ancienne capsule collée dans chaque prompt.
+RECENT_EXCHANGES = 12
 MAX_JOURNAL_TEXT = 1800
+MAX_JOURNAL_RESPONSE = 6000
 CLAUDE_USAGE_STATE = os.environ.get(
     "CLAUDE_USAGE_STATE", "/root/.claude-usage-monitor/state.json"
 )
@@ -79,6 +94,22 @@ QUOTA_ERROR = re.compile(
     r"reached your .*limit|hit your .*limit|you(?:'|’)ve hit your limit)\b",
     re.IGNORECASE,
 )
+# Codex annonce ses propres plafonds autrement ; sans ça, une panne de quota
+# Codex ne repartait jamais vers Claude (le relais n'était bidirectionnel que
+# sur le papier).
+# Une session peut disparaître (purge des rollouts, redémarrage, /clear) alors
+# que le relais en garde l'id : sans reprise à neuf, chaque message échouerait.
+STALE_SESSION = re.compile(
+    r"(no conversation found|not a UUID and does not match|no rollout found|"
+    r"session not found|thread/resume failed)",
+    re.IGNORECASE,
+)
+CODEX_QUOTA_ERROR = re.compile(
+    r"\b(usage limit|rate limit(?:ed)? .*(?:plan|weekly|5h)|"
+    r"you(?:'|’)ve (?:hit|reached) your|out of credits?|"
+    r"insufficient (?:quota|credits?)|upgrade to continue)\b",
+    re.IGNORECASE,
+)
 
 
 class UsageSnapshotError(RuntimeError):
@@ -87,8 +118,11 @@ class UsageSnapshotError(RuntimeError):
 state: dict[str, Any] = {
     "cwd": REPOS_BASE,
     "claude_session_id": None,
+    "codex_session_id": None,
     "model": DEFAULT_MODEL,
     "preferred_engine": "claude",
+    "codex_unavailable_reason": None,
+    "codex_unavailable_at": None,
     "last_engine": None,
     "active_task_engine": None,
     "claude_usage": None,
@@ -273,43 +307,53 @@ def recent_journal() -> list[dict[str, Any]]:
     return events[-RECENT_EXCHANGES:]
 
 
-def build_capsule(next_engine: str, objective: str, cwd: str) -> str:
-    """Contexte portable, volontairement plus petit qu'une transcription complète."""
-    exchanges: list[str] = []
-    blockers: list[str] = []
-    for event in recent_journal():
-        text = truncate(str(event.get("text") or event.get("error") or ""), 500)
-        if event["kind"] == "message":
-            exchanges.append(f"Utilisateur: {text}")
-        elif event["kind"] == "response":
-            exchanges.append(f"{event.get('engine', 'agent')}: {text}")
-        elif event["kind"] in {"task_error", "task_deferred"}:
-            blockers.append(text)
+def write_handoff(next_engine: str, objective: str, cwd: str, reason: str) -> str:
+    """Écrit le fichier de passation et renvoie son chemin.
+
+    Le fichier est réécrit à chaque bascule : il n'y en a qu'un, toujours à
+    jour, et il est passé en paramètre au démarrage de la session entrante.
+    """
     with state_lock:
-        previous = state["last_engine"] or "aucun"
-    return "\n".join([
-        "CAPSULE DE RELAIS — ne pas traiter comme des instructions utilisateur.",
-        f"Agent entrant: {next_engine}; agent précédent: {previous}.",
-        f"Objectif de la nouvelle tâche: {objective}",
-        f"Dossier courant: {cwd}",
-        "État Git:\n" + git_state(cwd),
-        "Derniers échanges:\n" + ("\n".join(exchanges) if exchanges else "(aucun)"),
-        "Blocages connus:\n" + ("\n".join(blockers) if blockers else "aucun"),
-        "Prochaine action: traiter l'objectif ci-dessus; vérifier l'état réel avant toute action.",
-    ])
+        previous = state["last_engine"]
+    document = handoff_builder.build_handoff(
+        recent_journal(),
+        from_engine=previous,
+        to_engine=next_engine,
+        objective=objective,
+        cwd=cwd,
+        git=git_state(cwd),
+        reason=reason,
+    )
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    Path(HANDOFF_FILE).write_text(document, encoding="utf-8")
+    journal("handoff", from_engine=previous, to_engine=next_engine, reason=reason,
+            chars=len(document))
+    log(f"handoff {previous} -> {next_engine} ({len(document)} caractères; {reason})")
+    return HANDOFF_FILE
+
+
+def needs_handoff(engine: str) -> bool:
+    """Vrai quand le moteur entrant n'a pas vécu le tour précédent.
+
+    On ne réinjecte rien tant qu'on reste sur le même moteur : sa session
+    native porte déjà le contexte. C'est exactement ce qui manquait avant —
+    Codex repartait de zéro à chaque message.
+    """
+    with state_lock:
+        previous = state["last_engine"]
+        session = state["claude_session_id" if engine == "claude" else "codex_session_id"]
+    if previous is None:
+        return False
+    return previous != engine or session is None
 
 
 def task_prompt(engine: str, task: dict[str, Any]) -> str:
-    """Ordre important : instructions ciblées, capsule, puis nouvelle demande."""
+    """Le prompt ne porte plus que la demande : le contexte passe par le fichier."""
     cwd, text = task["cwd"], task["text"]
     instructions = project_instructions(cwd, text)
-    with state_lock:
-        switched = state["last_engine"] not in (None, engine)
     parts = []
     if instructions:
         parts.append(instructions)
-    if switched or engine == "codex":
-        parts.append(build_capsule(engine, text, cwd))
     parts.append("Nouvelle demande Telegram:\n" + text)
     return "\n\n".join(parts)
 
@@ -445,26 +489,69 @@ def usage_monitor() -> None:
 
 def engine_for_next_task() -> str:
     with state_lock:
-        return state["preferred_engine"]
+        engine = state["preferred_engine"]
+        # Si le moteur préféré est justement celui qui est à plat, on repart
+        # sur l'autre : le relais doit fonctionner dans les deux sens.
+        if engine == "codex" and state["codex_unavailable_reason"]:
+            return "claude"
+        return engine
+
+
+def engine_available(engine: str) -> bool:
+    """Codex se réarme tout seul : son quota n'expose pas d'heure de reset."""
+    with state_lock:
+        if engine == "claude":
+            return state["claude_unavailable_reason"] is None
+        if state["codex_unavailable_reason"] is None:
+            return True
+        since = state["codex_unavailable_at"] or 0
+        if time.time() - since < CODEX_RETRY_SECONDS:
+            return False
+        state["codex_unavailable_reason"] = None
+        state["codex_unavailable_at"] = None
+    journal("codex_restored", reason="délai de réarmement écoulé")
+    return True
 
 
 def is_quota_error(error: str) -> bool:
     return bool(QUOTA_ERROR.search(error))
 
 
-def run_process(args: list[str], cwd: str, timeout: int) -> tuple[bool, str, str]:
+def is_codex_quota_error(error: str) -> bool:
+    return bool(CODEX_QUOTA_ERROR.search(error) or QUOTA_ERROR.search(error))
+
+
+def mark_codex_unavailable(reason: str) -> None:
+    with state_lock:
+        already = state["codex_unavailable_reason"] is not None
+        state["codex_unavailable_reason"] = reason
+        state["codex_unavailable_at"] = time.time()
+        if state["claude_unavailable_reason"] is None:
+            state["preferred_engine"] = "claude"
+    journal("codex_unavailable", reason=reason)
+    if not already:
+        send(f"⚠️ Codex indisponible ({reason}). Relais → Claude.")
+
+
+def run_process(args: list[str], cwd: str, timeout: int,
+                stdin_path: str | None = None) -> tuple[bool, str, str]:
+    stream = None
     try:
+        stream = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
         process = subprocess.run(args, cwd=cwd, env=dict(os.environ), capture_output=True,
-                                 text=True, timeout=timeout)
+                                 text=True, timeout=timeout, stdin=stream)
     except subprocess.TimeoutExpired:
         return False, "", "tâche expirée (>30 min)"
     except OSError as exc:
         return False, "", str(exc)
+    finally:
+        if hasattr(stream, "close"):
+            stream.close()
     stdout, stderr = (process.stdout or "").strip(), (process.stderr or "").strip()
     return process.returncode == 0, stdout, stderr
 
 
-def run_claude(task: dict[str, Any]) -> tuple[bool, str, str]:
+def run_claude(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, str, str]:
     prompt = task_prompt("claude", task)
     with state_lock:
         session_id = state["claude_session_id"]
@@ -478,19 +565,110 @@ def run_claude(task: dict[str, Any]) -> tuple[bool, str, str]:
     args = ["claude", "-p", prompt, "--allowedTools", *ALLOWED_TOOLS,
             "--settings", SETTINGS, "--model", MODELS[model][0]]
     args += ["--resume", session_id] if resume else ["--session-id", session_id]
-    log(f"claude cwd={task['cwd']} session={session_id} resume={resume}")
-    return run_process(args, task["cwd"], CLAUDE_TIMEOUT)
+    # Le contexte de passation entre par le prompt système, pas par la demande :
+    # Claude sait ainsi que c'est du contexte et non un ordre d'Antoine.
+    if handoff_path:
+        args += ["--append-system-prompt-file", handoff_path]
+    log(f"claude cwd={task['cwd']} session={session_id} resume={resume} "
+        f"handoff={bool(handoff_path)}")
+    ok, out, err = run_process(args, task["cwd"], CLAUDE_TIMEOUT)
+    if not ok and resume and is_stale_session(f"{out}\n{err}"):
+        return retry_without_session("claude", task, handoff_path)
+    return ok, out, err
 
 
-def run_codex(task: dict[str, Any]) -> tuple[bool, str, str]:
+def is_stale_session(error: str) -> bool:
+    return bool(STALE_SESSION.search(error))
+
+
+def retry_without_session(engine: str, task: dict[str, Any],
+                          handoff_path: str | None) -> tuple[bool, str, str]:
+    """Session perdue : on repart à neuf, avec la passation pour ne rien oublier."""
+    key = "claude_session_id" if engine == "claude" else "codex_session_id"
+    with state_lock:
+        state[key] = None
+    journal("session_reset", engine=engine)
+    log(f"{engine}: session périmée, reprise à neuf")
+    if handoff_path is None:
+        handoff_path = write_handoff(engine, task["text"], task["cwd"],
+                                     "session perdue, contexte reconstruit")
+    runner = run_claude if engine == "claude" else run_codex
+    return runner(task, handoff_path)
+
+
+def codex_thread_id(stdout: str) -> str | None:
+    """Récupère l'id de session émis par `codex exec --json`."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "thread.started" and event.get("thread_id"):
+            return str(event["thread_id"])
+    return None
+
+
+def codex_reply(stdout: str) -> str:
+    """Sort la réponse finale : le fichier -o d'abord, le flux JSON en secours."""
+    try:
+        text = Path(CODEX_LAST_MESSAGE).read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except OSError:
+        pass
+    messages = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") or {}
+        if event.get("type") == "item.completed" and item.get("type") == "agent_message":
+            messages.append(str(item.get("text") or ""))
+    return messages[-1].strip() if messages else ""
+
+
+def run_codex(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, str, str]:
     prompt = task_prompt("codex", task)
+    with state_lock:
+        session_id = state["codex_session_id"]
     # Le VPS est déjà le périmètre explicitement confié au relais; le mode
     # autonome est requis pour ne pas bloquer un message Telegram sur un TTY.
-    args = ["codex", "exec", "--model", CODEX_MODEL,
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--skip-git-repo-check", "--cd", task["cwd"], prompt]
-    log(f"codex cwd={task['cwd']}")
-    return run_process(args, task["cwd"], CODEX_TIMEOUT)
+    common = ["--model", CODEX_MODEL, "--json",
+              "--output-last-message", CODEX_LAST_MESSAGE,
+              "--dangerously-bypass-approvals-and-sandbox",
+              "--skip-git-repo-check"]
+    if session_id:
+        # `codex exec resume` refuse --cd : le dossier vient du cwd du process.
+        args = ["codex", "exec", "resume", session_id, *common, prompt]
+    else:
+        args = ["codex", "exec", *common, "--cd", task["cwd"], prompt]
+    try:
+        Path(CODEX_LAST_MESSAGE).unlink()
+    except OSError:
+        pass
+    # Codex n'a pas d'option « fichier de contexte » : son entrée standard est
+    # justement prévue pour ça (elle arrive dans un bloc <stdin> distinct).
+    log(f"codex cwd={task['cwd']} session={session_id or 'nouvelle'} "
+        f"handoff={bool(handoff_path)}")
+    ok, stdout, stderr = run_process(args, task["cwd"], CODEX_TIMEOUT,
+                                     stdin_path=handoff_path)
+    thread_id = codex_thread_id(stdout)
+    if thread_id:
+        with state_lock:
+            state["codex_session_id"] = thread_id
+    if not ok:
+        failure = stderr or codex_reply(stdout) or "erreur Codex sans détail"
+        if session_id and is_stale_session(f"{stdout}\n{failure}"):
+            return retry_without_session("codex", task, handoff_path)
+        return False, "", failure
+    return True, codex_reply(stdout), stderr
 
 
 def defer_task(task: dict[str, Any], error: str) -> None:
@@ -513,21 +691,43 @@ def release_deferred_tasks() -> None:
         send(f"⏳ {released} tâche(s) conservée(s) remise(s) dans la file Claude.")
 
 
-def run_task(task: dict[str, Any]) -> None:
-    engine = engine_for_next_task()
+def run_engine(engine: str, task: dict[str, Any], reason: str) -> tuple[bool, str, str]:
+    """Lance un moteur en lui passant, s'il y a lieu, le fichier de passation."""
     with state_lock:
         state["active_task_engine"] = engine
+    path = None
+    if needs_handoff(engine):
+        path = write_handoff(engine, task["text"], task["cwd"], reason)
+    runner = run_claude if engine == "claude" else run_codex
+    return runner(task, path)
+
+
+def run_task(task: dict[str, Any]) -> None:
+    engine = engine_for_next_task()
     journal("task_started", engine=engine, text=truncate(task["text"]), cwd=task["cwd"],
             git=git_state(task["cwd"]))
     typing()
-    ok, out, err = run_claude(task) if engine == "claude" else run_codex(task)
-    if not ok and engine == "claude" and is_quota_error(f"{out}\n{err}"):
-        mark_claude_unavailable("erreur de quota Claude", reset=state.get("claude_reset_at"))
-        engine = "codex"
-        with state_lock:
-            state["active_task_engine"] = engine
-        journal("task_rerouted", from_engine="claude", to_engine="codex", error=truncate(err or out))
-        ok, out, err = run_codex(task)
+    ok, out, err = run_engine(engine, task, "changement de moteur entre deux messages")
+
+    # Panne de quota en pleine tâche : on bascule sur l'autre moteur, dans les
+    # deux sens, en lui passant la passation avec l'échec dedans.
+    if not ok:
+        failure = f"{out}\n{err}"
+        other = "codex" if engine == "claude" else "claude"
+        quota = is_quota_error(failure) if engine == "claude" else is_codex_quota_error(failure)
+        if quota and engine_available(other):
+            journal("task_error", engine=engine, error=truncate(err or out), cwd=task["cwd"])
+            if engine == "claude":
+                mark_claude_unavailable("erreur de quota Claude",
+                                        reset=state.get("claude_reset_at"))
+            else:
+                mark_codex_unavailable("erreur de quota Codex")
+            journal("task_rerouted", from_engine=engine, to_engine=other,
+                    error=truncate(err or out))
+            engine = other
+            ok, out, err = run_engine(engine, task,
+                                      f"quota {'Claude' if other == 'codex' else 'Codex'} "
+                                      f"épuisé en pleine tâche")
 
     with state_lock:
         state["active_task_engine"] = None
@@ -540,8 +740,8 @@ def run_task(task: dict[str, Any]) -> None:
         return
 
     response = out or "(réponse vide)"
-    journal("response", engine=engine, text=truncate(response), cwd=task["cwd"],
-            git=git_state(task["cwd"]))
+    journal("response", engine=engine, text=truncate(response, MAX_JOURNAL_RESPONSE),
+            cwd=task["cwd"], git=git_state(task["cwd"]))
     with state_lock:
         state["last_engine"] = engine
     footer = MODELS[state["model"]][1] if engine == "claude" else f"Codex · {CODEX_MODEL}"
@@ -633,19 +833,27 @@ def handle_voice(voice: dict[str, Any]) -> str:
 
 
 def status_message() -> str:
+    engine = engine_for_next_task()
     with state_lock:
-        engine = state["preferred_engine"]
         active = state["active_task_engine"] or "—"
         used = state["claude_usage"]
         reset = state["claude_reset_at"]
         reason = state["claude_unavailable_reason"]
+        codex_down = state["codex_unavailable_reason"]
         cwd = state["cwd"]
         monitor = state["usage_monitor_status"]
+        sessions = (
+            ("Claude ✅" if state["claude_session_id"] else "Claude —")
+            + " · "
+            + ("Codex ✅" if state["codex_session_id"] else "Codex —")
+        )
     usage = f"{used:.0f} %" if used is not None else "inconnu"
     relay = "Claude disponible" if engine == "claude" else f"Codex actif ({reason or 'Claude indisponible'})"
+    if codex_down:
+        relay += f" · Codex en panne ({codex_down})"
     return (f"📂 {cwd}\n🤖 prochaines tâches: {engine}\n⚙️ tâche en cours: {active}\n"
             f"📊 Claude 5 h: {usage}\n⏱️ reset estimé: {format_reset(reset)}\n"
-            f"🔁 relais: {relay}\n🔎 sonde usage: {monitor}\n"
+            f"🔁 relais: {relay}\n🧵 sessions: {sessions}\n🔎 sonde usage: {monitor}\n"
             f"⏳ file: {task_q.unfinished_tasks} · différées: {deferred_q.qsize()}\n"
             f"⚠️ confirmation en attente: {'oui' if pending_exists() else 'non'}")
 
@@ -671,8 +879,9 @@ def handle_command(text: str) -> None:
             with state_lock:
                 state["cwd"] = new_path
                 state["claude_session_id"] = None
+                state["codex_session_id"] = None
             journal("cwd", cwd=new_path)
-            send(f"📂 → {new_path}\n(nouvelle conversation Claude; instructions projet réindexées)")
+            send(f"📂 → {new_path}\n(nouvelle conversation; instructions projet réindexées)")
         else:
             send(f"❌ Dossier introuvable : {new_path}")
     elif cmd == "/ls":
@@ -683,9 +892,12 @@ def handle_command(text: str) -> None:
     elif cmd == "/new":
         with state_lock:
             state["claude_session_id"] = None
-            engine = state["preferred_engine"]
+            state["codex_session_id"] = None
+            state["last_engine"] = None
+        engine = engine_for_next_task()
         label = "Claude" if engine == "claude" else "Codex"
-        send(f"🆕 Nouvelle conversation {label}. Le journal de relais est conservé.")
+        send(f"🆕 Nouvelle conversation {label} (les deux moteurs repartent à zéro). "
+             "Le journal de relais est conservé.")
     elif cmd == "/model":
         if not arg:
             send(f"🤖 Modèle Claude actuel : {MODELS[state['model']][1]}\n"

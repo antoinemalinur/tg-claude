@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,10 +12,13 @@ from unittest import mock
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "123")
-spec = importlib.util.spec_from_file_location("relay_bot", "/opt/tg-claude/bot.py")
+# Toujours tester le code du dépôt courant, jamais celui déployé dans /opt.
+BOT_PATH = Path(__file__).resolve().parent.parent / "bot.py"
+spec = importlib.util.spec_from_file_location("relay_bot", str(BOT_PATH))
 bot = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(bot)
+handoff_module = bot.handoff_builder
 
 
 class RelayUsageTests(unittest.TestCase):
@@ -29,8 +33,11 @@ class RelayUsageTests(unittest.TestCase):
             bot.state.update({
                 "cwd": "/root/repos",
                 "claude_session_id": None,
+                "codex_session_id": None,
                 "model": bot.DEFAULT_MODEL,
                 "preferred_engine": "claude",
+                "codex_unavailable_reason": None,
+                "codex_unavailable_at": None,
                 "last_engine": None,
                 "active_task_engine": None,
                 "claude_usage": None,
@@ -146,7 +153,8 @@ class RelayUsageTests(unittest.TestCase):
              mock.patch.object(bot, "send"), \
              mock.patch.object(bot, "typing"):
             bot.run_task(task)
-        codex.assert_called_once_with(task)
+        codex.assert_called_once()
+        self.assertEqual(codex.call_args.args[0], task)
         self.assertEqual(bot.state["preferred_engine"], "codex")
 
     def test_new_command_names_the_current_engine(self) -> None:
@@ -160,6 +168,184 @@ class RelayUsageTests(unittest.TestCase):
     def test_iso_reset_is_humanized(self) -> None:
         reset = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
         self.assertRegex(bot.format_reset(reset), r"dans 1 h 59|dans 2 h 00")
+
+
+class HandoffTests(unittest.TestCase):
+    """Le contexte ne doit traverser qu'au changement de moteur, dans les deux sens."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.handoff = Path(self.temp.name) / "handoff.md"
+        self.journal = Path(self.temp.name) / "journal.jsonl"
+        for name, value in (("HANDOFF_FILE", str(self.handoff)),
+                            ("JOURNAL", str(self.journal)),
+                            ("STATE_DIR", self.temp.name)):
+            patch = mock.patch.object(bot, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with bot.state_lock:
+            bot.state.update({
+                "cwd": "/root/repos",
+                "claude_session_id": None,
+                "codex_session_id": None,
+                "preferred_engine": "claude",
+                "codex_unavailable_reason": None,
+                "codex_unavailable_at": None,
+                "last_engine": None,
+                "active_task_engine": None,
+                "claude_unavailable_reason": None,
+            })
+
+    def write_journal(self, *events: dict) -> None:
+        self.journal.write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+        )
+
+    def test_same_engine_twice_sends_no_handoff(self) -> None:
+        bot.state["last_engine"] = "claude"
+        bot.state["claude_session_id"] = "abc"
+        self.assertFalse(bot.needs_handoff("claude"))
+
+    def test_engine_switch_requires_a_handoff_in_both_directions(self) -> None:
+        bot.state["last_engine"] = "claude"
+        bot.state["claude_session_id"] = "abc"
+        self.assertTrue(bot.needs_handoff("codex"))
+        bot.state["last_engine"] = "codex"
+        bot.state["codex_session_id"] = "xyz"
+        self.assertTrue(bot.needs_handoff("claude"))
+
+    def test_first_task_ever_has_nothing_to_hand_over(self) -> None:
+        bot.state["last_engine"] = None
+        self.assertFalse(bot.needs_handoff("claude"))
+
+    def test_same_engine_without_session_still_gets_context(self) -> None:
+        """Session perdue (redémarrage du bot) : le moteur repart aveugle sans ça."""
+        bot.state["last_engine"] = "codex"
+        bot.state["codex_session_id"] = None
+        self.assertTrue(bot.needs_handoff("codex"))
+
+    def test_handoff_file_holds_the_conversation_not_the_orders(self) -> None:
+        self.write_journal(
+            {"kind": "message", "text": "découpe les balades en segments"},
+            {"kind": "response", "engine": "claude", "text": "voici le raisonnement"},
+        )
+        bot.state["last_engine"] = "claude"
+        with mock.patch.object(bot, "git_state", return_value="hors dépôt Git"):
+            path = bot.write_handoff("codex", "continue le travail", "/root/repos", "test")
+        document = Path(path).read_text(encoding="utf-8")
+        self.assertIn("CONTEXTE DE PASSATION", document)
+        self.assertIn("découpe les balades en segments", document)
+        self.assertIn("voici le raisonnement", document)
+        self.assertIn("claude → codex", document)
+        self.assertIn("continue le travail", document)
+
+    def test_handoff_is_passed_as_a_file_parameter_to_claude(self) -> None:
+        bot.state["last_engine"] = "codex"
+        self.handoff.write_text("contexte", encoding="utf-8")
+        with mock.patch.object(bot, "run_process", return_value=(True, "ok", "")) as run:
+            bot.run_claude({"text": "suite", "cwd": "/root/repos"}, str(self.handoff))
+        args = run.call_args.args[0]
+        self.assertIn("--append-system-prompt-file", args)
+        self.assertEqual(args[args.index("--append-system-prompt-file") + 1],
+                         str(self.handoff))
+
+    def test_handoff_is_piped_into_codex_stdin(self) -> None:
+        self.handoff.write_text("contexte", encoding="utf-8")
+        with mock.patch.object(bot, "run_process", return_value=(True, "", "")) as run:
+            bot.run_codex({"text": "suite", "cwd": "/root/repos"}, str(self.handoff))
+        self.assertEqual(run.call_args.kwargs["stdin_path"], str(self.handoff))
+
+    def test_codex_session_is_resumed_instead_of_restarted(self) -> None:
+        stream = '{"type":"thread.started","thread_id":"thread-1"}'
+        with mock.patch.object(bot, "run_process", return_value=(True, stream, "")):
+            bot.run_codex({"text": "un", "cwd": "/root/repos"}, None)
+        self.assertEqual(bot.state["codex_session_id"], "thread-1")
+        with mock.patch.object(bot, "run_process", return_value=(True, stream, "")) as run:
+            bot.run_codex({"text": "deux", "cwd": "/root/repos"}, None)
+        args = run.call_args.args[0]
+        self.assertEqual(args[1:4], ["exec", "resume", "thread-1"])
+
+    def test_codex_reply_comes_from_the_json_stream(self) -> None:
+        stream = (
+            '{"type":"thread.started","thread_id":"t"}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"PONG"}}'
+        )
+        with mock.patch.object(bot, "CODEX_LAST_MESSAGE", str(Path(self.temp.name) / "absent")), \
+             mock.patch.object(bot, "run_process", return_value=(True, stream, "")):
+            ok, out, _ = bot.run_codex({"text": "ping", "cwd": "/root/repos"}, None)
+        self.assertTrue(ok)
+        self.assertEqual(out, "PONG")
+
+    def test_codex_quota_error_falls_back_to_claude(self) -> None:
+        bot.state["preferred_engine"] = "codex"
+        bot.state["last_engine"] = "codex"
+        task = {"text": "suite", "cwd": "/root/repos"}
+        with mock.patch.object(bot, "run_codex", return_value=(False, "", "You've hit your usage limit")), \
+             mock.patch.object(bot, "run_claude", return_value=(True, "fait", "")) as claude, \
+             mock.patch.object(bot, "journal"), \
+             mock.patch.object(bot, "write_handoff", return_value="/tmp/h.md") as handoff, \
+             mock.patch.object(bot, "git_state", return_value=""), \
+             mock.patch.object(bot, "send"), \
+             mock.patch.object(bot, "typing"):
+            bot.run_task(task)
+        claude.assert_called_once()
+        self.assertEqual(claude.call_args.args[1], "/tmp/h.md")
+        self.assertIn("quota", handoff.call_args.args[3])
+        self.assertEqual(bot.state["last_engine"], "claude")
+
+    def test_codex_is_rearmed_after_the_retry_delay(self) -> None:
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"):
+            bot.mark_codex_unavailable("erreur de quota Codex")
+            self.assertFalse(bot.engine_available("codex"))
+            bot.state["codex_unavailable_at"] = time.time() - bot.CODEX_RETRY_SECONDS - 1
+            self.assertTrue(bot.engine_available("codex"))
+
+    def test_stale_claude_session_is_restarted_with_context(self) -> None:
+        bot.state["claude_session_id"] = "019f7c33-0000-0000-0000-000000000000"
+        bot.state["last_engine"] = "claude"
+        results = [(False, "", "No conversation found with session ID: 019f…"),
+                   (True, "fait", "")]
+        with mock.patch.object(bot, "run_process", side_effect=results) as run, \
+             mock.patch.object(bot, "journal"), \
+             mock.patch.object(bot, "git_state", return_value=""):
+            ok, out, _ = bot.run_claude({"text": "suite", "cwd": "/root/repos"}, None)
+        self.assertTrue(ok)
+        self.assertEqual(out, "fait")
+        # Deuxième tentative : session neuve (--session-id) et passation jointe.
+        second = run.call_args.args[0]
+        self.assertIn("--session-id", second)
+        self.assertNotIn("--resume", second)
+        self.assertIn("--append-system-prompt-file", second)
+
+    def test_stale_codex_session_is_restarted(self) -> None:
+        bot.state["codex_session_id"] = "019f7c33-0000-0000-0000-000000000000"
+        bot.state["last_engine"] = "codex"
+        stream = '{"type":"thread.started","thread_id":"neuf"}'
+        results = [(False, "", "thread/resume failed: no rollout found for thread id"),
+                   (True, stream, "")]
+        with mock.patch.object(bot, "run_process", side_effect=results) as run, \
+             mock.patch.object(bot, "CODEX_LAST_MESSAGE", str(Path(self.temp.name) / "x")), \
+             mock.patch.object(bot, "journal"), \
+             mock.patch.object(bot, "git_state", return_value=""):
+            ok, _, _ = bot.run_codex({"text": "suite", "cwd": "/root/repos"}, None)
+        self.assertTrue(ok)
+        self.assertNotIn("resume", run.call_args.args[0][:4])
+        self.assertEqual(bot.state["codex_session_id"], "neuf")
+
+    def test_recent_exchanges_are_kept_fuller_than_old_ones(self) -> None:
+        events = [{"kind": "response", "engine": "claude", "text": "A" * 5000},
+                  {"kind": "response", "engine": "claude", "text": "B" * 5000}]
+        rendered = handoff_module.render_exchanges(events)
+        self.assertGreater(rendered.count("B"), rendered.count("A"))
+
+    def test_handoff_document_stays_within_budget(self) -> None:
+        events = [{"kind": "message", "text": "X" * 4000} for _ in range(40)]
+        document = handoff_module.build_handoff(
+            events, from_engine="claude", to_engine="codex", objective="o",
+            cwd="/root/repos", git="", reason="test",
+        )
+        self.assertLessEqual(len(document), handoff_module.MAX_TOTAL_CHARS)
 
 
 if __name__ == "__main__":
