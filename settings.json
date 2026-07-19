@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /opt/tg-claude/confirm_hook.py",
+            "timeout": 330
+          }
+        ]
+      }
+    ]
+  }
+}
