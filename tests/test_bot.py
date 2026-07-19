@@ -20,6 +20,18 @@ assert spec.loader is not None
 spec.loader.exec_module(bot)
 handoff_module = bot.handoff_builder
 
+# Les tests exercent run_claude/run_codex, qui persistent désormais les ids de
+# session : sans cette redirection, `unittest discover` (lancé par deploy.py
+# AVANT le redémarrage) écraserait les fichiers d'état du service en marche.
+# Même principe pour le journal, le log et la passation : les tests écrivaient
+# leurs événements factices dans les fichiers du service (constaté en prod).
+_TEST_STATE_DIR = tempfile.mkdtemp(prefix="tg-claude-test-state-")
+bot.STATE_DIR = _TEST_STATE_DIR
+bot.JOURNAL = os.path.join(_TEST_STATE_DIR, "relay-journal.jsonl")
+bot.HANDOFF_FILE = os.path.join(_TEST_STATE_DIR, "handoff.md")
+bot.CODEX_LAST_MESSAGE = os.path.join(_TEST_STATE_DIR, "codex-last-message.txt")
+bot.LOG = os.path.join(_TEST_STATE_DIR, "bot.log")
+
 
 class RelayUsageTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -346,6 +358,111 @@ class HandoffTests(unittest.TestCase):
             cwd="/root/repos", git="", reason="test",
         )
         self.assertLessEqual(len(document), handoff_module.MAX_TOTAL_CHARS)
+
+
+class ContextAndPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state_dir = str(Path(self.temp.name) / "state")
+        Path(self.state_dir).mkdir()
+        self.patches = [
+            mock.patch.object(bot, "STATE_DIR", self.state_dir),
+            mock.patch.object(bot, "CLAUDE_PROJECTS_DIR",
+                              str(Path(self.temp.name) / "projects")),
+            mock.patch.object(bot, "CODEX_SESSIONS_DIR",
+                              str(Path(self.temp.name) / "sessions")),
+        ]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        with bot.state_lock:
+            bot.state.update({
+                "cwd": "/root/repos", "model": "fable",
+                "claude_session_id": None, "codex_session_id": None,
+                "last_engine": None,
+            })
+
+    def _write_claude_transcript(self, session_id: str) -> None:
+        directory = Path(self.temp.name) / "projects" / "-root-repos"
+        directory.mkdir(parents=True)
+        usage = {"input_tokens": 2, "cache_read_input_tokens": 196_578,
+                 "cache_creation_input_tokens": 18_839, "output_tokens": 2679}
+        lines = [
+            json.dumps({"type": "user", "message": {"content": "salut"}}),
+            json.dumps({"type": "assistant",
+                        "message": {"usage": {"input_tokens": 1,
+                                              "cache_read_input_tokens": 10}}}),
+            json.dumps({"type": "assistant", "message": {"usage": usage}}),
+        ]
+        (directory / f"{session_id}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+
+    def test_claude_context_reads_last_assistant_usage(self) -> None:
+        session = "11111111-2222-3333-4444-555555555555"
+        self._write_claude_transcript(session)
+        with bot.state_lock:
+            bot.state["claude_session_id"] = session
+        # 2 + 196 578 + 18 839 = 215 419 tokens sur 1M (Fable) → 22 %.
+        self.assertEqual(bot.claude_context(), "22 % (215k/1M)")
+
+    def test_claude_context_without_session_or_transcript(self) -> None:
+        self.assertIsNone(bot.claude_context())
+        with bot.state_lock:
+            bot.state["claude_session_id"] = "absent-du-disque"
+        self.assertIsNone(bot.claude_context())
+
+    def test_codex_context_reads_token_count_and_window(self) -> None:
+        thread = "019f7cbc-327b-7402-b2d7-dcb7dd431b6a"
+        directory = Path(self.temp.name) / "sessions" / "2026" / "07" / "19"
+        directory.mkdir(parents=True)
+        event = {"timestamp": "2026-07-19T23:35:40Z", "type": "event_msg",
+                 "payload": {"type": "token_count", "info": {
+                     "last_token_usage": {"input_tokens": 12_741, "output_tokens": 5},
+                     "model_context_window": 258_400}}}
+        (directory / f"rollout-2026-07-19T19-35-36-{thread}.jsonl").write_text(
+            json.dumps({"type": "session_meta"}) + "\n" + json.dumps(event),
+            encoding="utf-8")
+        with bot.state_lock:
+            bot.state["codex_session_id"] = thread
+        self.assertEqual(bot.codex_context(), "5 % (13k/258k)")
+
+    def test_status_shows_context_line_with_fallbacks(self) -> None:
+        self.assertIn("🧠 contexte: Claude — · Codex —", bot.status_message())
+
+    def test_sessions_survive_restart(self) -> None:
+        with bot.state_lock:
+            bot.state.update({"claude_session_id": "abc-123",
+                              "codex_session_id": "def-456",
+                              "last_engine": "claude", "cwd": "/root/repos"})
+        for key in bot.PERSISTED_KEYS:
+            bot.persist_state_key(key)
+        with bot.state_lock:  # simule le redémarrage du service
+            bot.state.update({"claude_session_id": None, "codex_session_id": None,
+                              "last_engine": None, "cwd": "/tmp"})
+        bot.restore_persisted_state()
+        self.assertEqual(bot.state["claude_session_id"], "abc-123")
+        self.assertEqual(bot.state["codex_session_id"], "def-456")
+        self.assertEqual(bot.state["last_engine"], "claude")
+        self.assertEqual(bot.state["cwd"], "/root/repos")
+
+    def test_cleared_session_is_not_resurrected(self) -> None:
+        with bot.state_lock:
+            bot.state["claude_session_id"] = "abc-123"
+        bot.persist_state_key("claude_session_id")
+        with bot.state_lock:
+            bot.state["claude_session_id"] = None
+        bot.persist_state_key("claude_session_id")  # /new : le fichier disparaît
+        bot.restore_persisted_state()
+        self.assertIsNone(bot.state["claude_session_id"])
+
+    def test_restored_cwd_must_exist(self) -> None:
+        with bot.state_lock:
+            bot.state["cwd"] = "/dossier/disparu"
+        Path(self.state_dir, "cwd").write_text("/dossier/disparu", encoding="utf-8")
+        with bot.state_lock:
+            bot.state["cwd"] = "/root/repos"
+        bot.restore_persisted_state()
+        self.assertEqual(bot.state["cwd"], "/root/repos")
 
 
 if __name__ == "__main__":

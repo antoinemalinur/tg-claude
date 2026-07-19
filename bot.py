@@ -15,6 +15,7 @@ passé en paramètre au démarrage de la session entrante — dans les deux sens
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import queue
@@ -72,14 +73,26 @@ CLAUDE_USAGE_STATE = os.environ.get(
     "CLAUDE_USAGE_STATE", "/root/.claude-usage-monitor/state.json"
 )
 
+# (id API, libellé, fenêtre de contexte en tokens — docs Anthropic 07/2026)
 MODELS = {
-    "opus": ("claude-opus-4-8", "Opus 4.8"),
-    "sonnet": ("claude-sonnet-5", "Sonnet 5"),
-    "haiku": ("claude-haiku-4-5-20251001", "Haiku 4.5"),
-    "fable": ("claude-fable-5", "Fable 5"),
+    "opus": ("claude-opus-4-8", "Opus 4.8", 1_000_000),
+    "sonnet": ("claude-sonnet-5", "Sonnet 5", 1_000_000),
+    "haiku": ("claude-haiku-4-5-20251001", "Haiku 4.5", 200_000),
+    "fable": ("claude-fable-5", "Fable 5", 1_000_000),
 }
 DEFAULT_MODEL = "opus"
 MODEL_FILE = os.path.join(STATE_DIR, "model")
+
+# Transcripts des sessions natives : c'est là (et seulement là) que vivent les
+# compteurs de contexte — le CLI Claude n'expose rien en sortie texte, et le
+# rollout Codex porte sa propre fenêtre (model_context_window).
+CLAUDE_PROJECTS_DIR = os.environ.get("CLAUDE_PROJECTS_DIR", "/root/.claude/projects")
+CODEX_SESSIONS_DIR = os.environ.get("CODEX_SESSIONS_DIR", "/root/.codex/sessions")
+CODEX_FALLBACK_WINDOW = 272_000
+
+# Clés d'état qui survivent à un redémarrage du service : sans elles, chaque
+# déploiement perdait les sessions natives (et donc tout le contexte).
+PERSISTED_KEYS = ("claude_session_id", "codex_session_id", "last_engine", "cwd")
 
 CONFIRM_WORDS = {"confirme", "confirm", "oui", "yes", "ok", "y", "✅"}
 CANCEL_WORDS = {"annule", "cancel", "non", "no", "n", "❌", "stop"}
@@ -208,6 +221,40 @@ def save_model(model: str) -> None:
         Path(MODEL_FILE).write_text(model, encoding="utf-8")
     except OSError as exc:
         log(f"model save error: {exc}")
+
+
+def _state_file(key: str) -> Path:
+    return Path(STATE_DIR, key.replace("_", "-"))
+
+
+def persist_state_key(key: str) -> None:
+    """Écrit (ou efface) la valeur persistée d'une clé d'état. À appeler à
+    chaque mutation d'une clé de PERSISTED_KEYS, sous state_lock ou non."""
+    with state_lock:
+        value = state.get(key)
+    try:
+        if value:
+            _state_file(key).write_text(str(value), encoding="utf-8")
+        else:
+            _state_file(key).unlink(missing_ok=True)
+    except OSError as exc:
+        log(f"persist {key} error: {exc}")
+
+
+def restore_persisted_state() -> None:
+    """Recharge les sessions natives et le cwd après un redémarrage : la
+    conversation reprend là où elle en était au lieu de repartir à zéro."""
+    for key in PERSISTED_KEYS:
+        try:
+            value = _state_file(key).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not value:
+            continue
+        if key == "cwd" and not os.path.isdir(value):
+            continue
+        with state_lock:
+            state[key] = value
 
 
 def truncate(value: str, limit: int = MAX_JOURNAL_TEXT) -> str:
@@ -562,6 +609,7 @@ def run_claude(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, st
             resume = False
         else:
             resume = True
+    persist_state_key("claude_session_id")
     args = ["claude", "-p", prompt, "--allowedTools", *ALLOWED_TOOLS,
             "--settings", SETTINGS, "--model", MODELS[model][0]]
     args += ["--resume", session_id] if resume else ["--session-id", session_id]
@@ -587,6 +635,7 @@ def retry_without_session(engine: str, task: dict[str, Any],
     key = "claude_session_id" if engine == "claude" else "codex_session_id"
     with state_lock:
         state[key] = None
+    persist_state_key(key)
     journal("session_reset", engine=engine)
     log(f"{engine}: session périmée, reprise à neuf")
     if handoff_path is None:
@@ -663,6 +712,7 @@ def run_codex(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, str
     if thread_id:
         with state_lock:
             state["codex_session_id"] = thread_id
+        persist_state_key("codex_session_id")
     if not ok:
         failure = stderr or codex_reply(stdout) or "erreur Codex sans détail"
         if session_id and is_stale_session(f"{stdout}\n{failure}"):
@@ -744,6 +794,7 @@ def run_task(task: dict[str, Any]) -> None:
             cwd=task["cwd"], git=git_state(task["cwd"]))
     with state_lock:
         state["last_engine"] = engine
+    persist_state_key("last_engine")
     footer = MODELS[state["model"]][1] if engine == "claude" else f"Codex · {CODEX_MODEL}"
     send(f"{response}\n\n— 🤖 {footer}")
 
@@ -832,6 +883,83 @@ def handle_voice(voice: dict[str, Any]) -> str:
     return text
 
 
+def _tail_lines(path: str, max_bytes: int = 262_144) -> list[str]:
+    """Dernières lignes d'un fichier sans le lire en entier (transcripts longs)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def _fmt_tokens(n: int) -> str:
+    return f"{n / 1_000_000:.1f}M".replace(".0M", "M") if n >= 1_000_000 else f"{round(n / 1000)}k"
+
+
+def _fmt_context(tokens: int, window: int) -> str:
+    return f"{min(100, round(100 * tokens / window))} % ({_fmt_tokens(tokens)}/{_fmt_tokens(window)})"
+
+
+def claude_context() -> str | None:
+    """Contexte de la session Claude, lu dans son transcript JSONL : le dernier
+    message assistant porte le cumul (input + caches) de la requête."""
+    with state_lock:
+        session_id = state["claude_session_id"]
+        window = MODELS[state["model"]][2]
+    if not session_id:
+        return None
+    matches = glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    if not matches:
+        return None
+    for line in reversed(_tail_lines(max(matches, key=os.path.getmtime))):
+        if '"usage"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # première ligne tronquée par la lecture en queue, etc.
+        if event.get("type") != "assistant":
+            continue
+        usage = (event.get("message") or {}).get("usage")
+        if not usage:
+            continue
+        tokens = sum(int(usage.get(k) or 0) for k in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        return _fmt_context(tokens, window)
+    return None
+
+
+def codex_context() -> str | None:
+    """Contexte de la session Codex, lu dans son rollout : l'événement
+    token_count fournit l'usage ET la fenêtre effective du modèle."""
+    with state_lock:
+        session_id = state["codex_session_id"]
+    if not session_id:
+        return None
+    matches = glob.glob(os.path.join(CODEX_SESSIONS_DIR, "**", f"*{session_id}.jsonl"),
+                        recursive=True)
+    if not matches:
+        return None
+    for line in reversed(_tail_lines(max(matches, key=os.path.getmtime))):
+        if '"token_count"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = event.get("payload") or {}
+        info = payload.get("info")
+        if payload.get("type") != "token_count" or not info:
+            continue
+        last = info.get("last_token_usage") or {}
+        tokens = int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)
+        window = int(info.get("model_context_window") or CODEX_FALLBACK_WINDOW)
+        return _fmt_context(tokens, window)
+    return None
+
+
 def status_message() -> str:
     engine = engine_for_next_task()
     with state_lock:
@@ -851,8 +979,11 @@ def status_message() -> str:
     relay = "Claude disponible" if engine == "claude" else f"Codex actif ({reason or 'Claude indisponible'})"
     if codex_down:
         relay += f" · Codex en panne ({codex_down})"
+    contexts = (f"Claude {claude_context() or '—'} · "
+                f"Codex {codex_context() or '—'}")
     return (f"📂 {cwd}\n🤖 prochaines tâches: {engine}\n⚙️ tâche en cours: {active}\n"
             f"📊 Claude 5 h: {usage}\n⏱️ reset estimé: {format_reset(reset)}\n"
+            f"🧠 contexte: {contexts}\n"
             f"🔁 relais: {relay}\n🧵 sessions: {sessions}\n🔎 sonde usage: {monitor}\n"
             f"⏳ file: {task_q.unfinished_tasks} · différées: {deferred_q.qsize()}\n"
             f"⚠️ confirmation en attente: {'oui' if pending_exists() else 'non'}")
@@ -880,6 +1011,8 @@ def handle_command(text: str) -> None:
                 state["cwd"] = new_path
                 state["claude_session_id"] = None
                 state["codex_session_id"] = None
+            for key in ("cwd", "claude_session_id", "codex_session_id"):
+                persist_state_key(key)
             journal("cwd", cwd=new_path)
             send(f"📂 → {new_path}\n(nouvelle conversation; instructions projet réindexées)")
         else:
@@ -894,6 +1027,8 @@ def handle_command(text: str) -> None:
             state["claude_session_id"] = None
             state["codex_session_id"] = None
             state["last_engine"] = None
+        for key in ("claude_session_id", "codex_session_id", "last_engine"):
+            persist_state_key(key)
         engine = engine_for_next_task()
         label = "Claude" if engine == "claude" else "Codex"
         send(f"🆕 Nouvelle conversation {label} (les deux moteurs repartent à zéro). "
@@ -972,6 +1107,7 @@ def main() -> None:
         except FileNotFoundError:
             pass
     state["model"] = load_model()
+    restore_persisted_state()
     threading.Thread(target=worker, daemon=True, name="relay-worker").start()
     threading.Thread(target=usage_monitor, daemon=True, name="claude-usage-monitor").start()
     log(f"bot started (model={state['model']})")
