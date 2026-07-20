@@ -1,4 +1,7 @@
 {
+  "permissions": {
+    "allow": ["mcp__claude_ai_Gmail__create_draft"]
+  },
   "hooks": {
     "PreToolUse": [
       {
