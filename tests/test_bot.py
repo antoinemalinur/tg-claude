@@ -54,9 +54,12 @@ class RelayUsageTests(unittest.TestCase):
                 "active_task_engine": None,
                 "claude_usage": None,
                 "claude_reset_at": None,
+                "claude_weekly_usage": None,
+                "claude_weekly_reset_at": None,
                 "claude_usage_observed_at": None,
                 "claude_unavailable_reset_at": None,
                 "claude_unavailable_reason": None,
+                "claude_unavailable_window": None,
                 "usage_monitor_status": "initialisation",
             })
 
@@ -66,14 +69,21 @@ class RelayUsageTests(unittest.TestCase):
         reset: str = "2026-07-20T01:00:00+00:00",
         age_seconds: int = 0,
         error: str | None = None,
+        weekly: float | None = 10.0,
+        weekly_reset: str | None = "2026-07-26T16:00:00+00:00",
+        omit_weekly: bool = False,
     ) -> None:
         observed = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
-        self.snapshot.write_text(json.dumps({
+        payload = {
             "last_percent": percent,
             "last_reset": reset,
             "observed_at": observed.isoformat(),
             "last_error": error,
-        }))
+        }
+        if not omit_weekly:  # sonde d'avant la fenêtre hebdo → clés absentes
+            payload["weekly_percent"] = weekly
+            payload["weekly_reset"] = weekly_reset
+        self.snapshot.write_text(json.dumps(payload))
 
     def test_fresh_low_usage_keeps_claude(self) -> None:
         self.write_snapshot(76)
@@ -122,10 +132,93 @@ class RelayUsageTests(unittest.TestCase):
         with self.assertRaisesRegex(bot.UsageSnapshotError, "hors limites"):
             bot.load_claude_usage_snapshot()
 
+    # --- Fenêtre hebdomadaire : même principe que la 5 h ---
+
+    def test_weekly_at_98_switches_new_tasks_to_codex(self) -> None:
+        # 5 h tranquille, mais le mur hebdomadaire est atteint.
+        self.write_snapshot(12, weekly=98.0)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send") as send:
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "codex")
+        self.assertEqual(bot.state["claude_unavailable_window"], bot.WINDOW_WEEKLY)
+        self.assertIn("semaine", bot.state["claude_unavailable_reason"])
+        self.assertIn("semaine", send.call_args.args[0])
+
+    def test_weekly_block_survives_a_five_hour_rollover(self) -> None:
+        """Régression : bloqué par l'hebdo, un nouveau créneau 5 h (usage ~0,
+        reset différent) ne doit PAS rendre la main à Claude — le mur tient."""
+        self.write_snapshot(99, weekly=99.0)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["claude_unavailable_window"], bot.WINDOW_WEEKLY)
+        # Nouvelle session 5 h : 0 %, reset décalé. L'hebdo, elle, n'a pas bougé.
+        self.write_snapshot(0, reset="2026-07-20T06:00:00+00:00", weekly=99.0)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"), \
+             mock.patch.object(bot, "release_deferred_tasks"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "codex")
+        self.assertIsNotNone(bot.state["claude_unavailable_reason"])
+
+    def test_weekly_rollover_restores_claude(self) -> None:
+        self.write_snapshot(12, weekly=98.0)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "codex")
+        # La semaine tourne : usage au plancher et reset décalé d'une semaine.
+        self.write_snapshot(12, weekly=1.0, weekly_reset="2026-08-02T16:00:00+00:00")
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send") as send, \
+             mock.patch.object(bot, "release_deferred_tasks") as released:
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "claude")
+        self.assertIsNone(bot.state["claude_unavailable_window"])
+        self.assertIn("semaine", send.call_args.args[0])
+        released.assert_called_once()
+
+    def test_five_hour_block_ignores_weekly_rollover(self) -> None:
+        # Symétrique : bloqué par la 5 h, c'est bien SON reset qu'on attend.
+        self.write_snapshot(99, weekly=40.0)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["claude_unavailable_window"], bot.WINDOW_FIVE_HOUR)
+        self.write_snapshot(99, weekly=1.0, weekly_reset="2026-08-02T16:00:00+00:00")
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"), \
+             mock.patch.object(bot, "release_deferred_tasks"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "codex")
+
+    def test_snapshot_without_weekly_keeps_five_hour_behaviour(self) -> None:
+        # Sonde pas encore redéployée : pas de clé hebdo, le relais fonctionne.
+        self.write_snapshot(50, omit_weekly=True)
+        with mock.patch.object(bot, "journal"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "claude")
+        self.assertIsNone(bot.state["claude_weekly_usage"])
+        self.write_snapshot(98, omit_weekly=True)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"):
+            bot.update_claude_usage()
+        self.assertEqual(bot.state["preferred_engine"], "codex")
+        self.assertEqual(bot.state["claude_unavailable_window"], bot.WINDOW_FIVE_HOUR)
+
+    def test_absurd_weekly_value_is_ignored_not_fatal(self) -> None:
+        self.write_snapshot(50, weekly=140.0)
+        with mock.patch.object(bot, "journal"):
+            bot.update_claude_usage()
+        self.assertIsNone(bot.state["claude_weekly_usage"])
+        self.assertEqual(bot.state["preferred_engine"], "claude")
+
+    def test_status_shows_both_windows(self) -> None:
+        self.write_snapshot(67, weekly=98.0)
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"):
+            bot.update_claude_usage()
+        message = bot.status_message()
+        self.assertIn("Claude 5 h: 67 %", message)
+        self.assertIn("Claude semaine: 98 %", message)
+
     def test_new_window_restores_claude(self) -> None:
         with bot.state_lock:
             bot.state["preferred_engine"] = "codex"
             bot.state["claude_unavailable_reason"] = "seuil 98 % atteint"
+            bot.state["claude_unavailable_window"] = bot.WINDOW_FIVE_HOUR
             bot.state["claude_unavailable_reset_at"] = "2026-07-19T20:00:00+00:00"
         self.write_snapshot(1, reset="2026-07-20T01:00:00+00:00")
         with mock.patch.object(bot, "journal"), \

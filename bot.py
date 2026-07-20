@@ -29,7 +29,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import handoff as handoff_builder  # noqa: E402  (dépend du chemin ci-dessus)
@@ -63,6 +63,12 @@ USAGE_POLL_SECONDS = 120
 USAGE_SNAPSHOT_MAX_AGE = 900
 CLAUDE_LIMIT_PERCENT = 98.0
 CLAUDE_RECOVERED_PERCENT = 5.0
+# Les deux plafonds Claude. L'hebdomadaire bloque autant qu'une session pleine,
+# mais se libère beaucoup plus tard : c'est LUI qui doit gouverner le retour,
+# sinon un simple rollover 5 h rendrait la main à Claude devant un mur intact.
+WINDOW_FIVE_HOUR = "five_hour"
+WINDOW_WEEKLY = "seven_day"
+WINDOW_LABELS = {WINDOW_FIVE_HOUR: "session 5 h", WINDOW_WEEKLY: "semaine"}
 CODEX_RETRY_SECONDS = 3600
 # Le fichier de passation ne sert qu'au changement de moteur : on peut y mettre
 # bien plus que l'ancienne capsule collée dans chaque prompt.
@@ -140,9 +146,13 @@ state: dict[str, Any] = {
     "active_task_engine": None,
     "claude_usage": None,
     "claude_reset_at": None,
+    "claude_weekly_usage": None,
+    "claude_weekly_reset_at": None,
     "claude_usage_observed_at": None,
     "claude_unavailable_reset_at": None,
     "claude_unavailable_reason": None,
+    # Fenêtre ayant causé le blocage : c'est son rollover à elle qu'on attend.
+    "claude_unavailable_window": None,
     "usage_monitor_status": "initialisation",
 }
 state_lock = threading.RLock()
@@ -413,7 +423,26 @@ def _parse_datetime(value: str) -> datetime:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 
-def load_claude_usage_snapshot() -> tuple[float, str | None, str, int, str | None]:
+class UsageSnapshot(NamedTuple):
+    """Les deux fenêtres publiées par la sonde. `weekly` est optionnelle :
+    un snapshot écrit par une version antérieure du moniteur n'en a pas, et
+    l'absence ne doit jamais rendre Claude indisponible."""
+    used: float                 # fenêtre 5 h (toujours présente)
+    reset: str | None
+    weekly: float | None        # fenêtre 7 j (None = inconnue)
+    weekly_reset: str | None
+    observed: str
+    age: int
+    last_error: str | None
+
+    def window(self, name: str) -> tuple[float | None, str | None]:
+        """(pourcentage, reset) de la fenêtre nommée."""
+        if name == WINDOW_WEEKLY:
+            return self.weekly, self.weekly_reset
+        return self.used, self.reset
+
+
+def load_claude_usage_snapshot() -> UsageSnapshot:
     """Lit le cache du moniteur sans faire de second appel à Anthropic."""
     path = Path(CLAUDE_USAGE_STATE)
     try:
@@ -431,6 +460,15 @@ def load_claude_usage_snapshot() -> tuple[float, str | None, str, int, str | Non
     if not 0 <= used <= 100:
         raise UsageSnapshotError("pourcentage hors limites dans le snapshot")
 
+    # Hebdo absente ou aberrante : on la déclare inconnue plutôt que de lever.
+    # Une sonde plus ancienne ne doit pas priver le relais de sa fenêtre 5 h.
+    try:
+        weekly: float | None = float(payload.get("weekly_percent"))
+        if not 0 <= weekly <= 100:
+            weekly = None
+    except (TypeError, ValueError):
+        weekly = None
+
     observed = payload.get("observed_at")
     if observed:
         observed_at = _parse_datetime(str(observed))
@@ -443,13 +481,16 @@ def load_claude_usage_snapshot() -> tuple[float, str | None, str, int, str | Non
         raise UsageSnapshotError(f"snapshot périmé ({age} s)")
 
     reset = payload.get("last_reset")
+    weekly_reset = payload.get("weekly_reset")
     last_error = payload.get("last_error")
-    return (
-        used,
-        str(reset) if reset else None,
-        observed_label,
-        age,
-        str(last_error) if last_error else None,
+    return UsageSnapshot(
+        used=used,
+        reset=str(reset) if reset else None,
+        weekly=weekly,
+        weekly_reset=str(weekly_reset) if weekly_reset else None,
+        observed=observed_label,
+        age=age,
+        last_error=str(last_error) if last_error else None,
     )
 
 
@@ -471,52 +512,85 @@ def format_reset(reset: str | None) -> str:
             return reset
 
 
-def mark_claude_unavailable(reason: str, used: float | None = None, reset: str | None = None) -> None:
+def mark_claude_unavailable(reason: str, used: float | None = None, reset: str | None = None,
+                            window: str | None = None) -> None:
     with state_lock:
         already = state["claude_unavailable_reason"] is not None
         state["preferred_engine"] = "codex"
         state["claude_unavailable_reason"] = reason
         state["claude_unavailable_reset_at"] = reset or state["claude_reset_at"]
+        # Sans fenêtre identifiée (erreur de quota du CLI), on retombe sur la
+        # 5 h : c'est le comportement historique.
+        state["claude_unavailable_window"] = window or WINDOW_FIVE_HOUR
         if used is not None:
-            state["claude_usage"] = used
-    journal("claude_unavailable", reason=reason, usage=used, reset_at=reset)
+            state["claude_usage" if window != WINDOW_WEEKLY else "claude_weekly_usage"] = used
+    journal("claude_unavailable", reason=reason, usage=used, reset_at=reset, window=window)
     if not already:
         usage_label = f"{used:.0f}%" if used is not None else "inconnu"
         send("⚠️ Claude indisponible pour les nouvelles tâches "
              f"({reason}; usage {usage_label}). Relais → Codex.")
 
 
-def restore_claude(used: float, reset: str | None) -> None:
+def restore_claude(snapshot: UsageSnapshot) -> None:
+    """Rend la main à Claude quand la fenêtre QUI A BLOQUÉ a réellement tourné.
+
+    On exige un reset différent de celui mémorisé (nouvelle fenêtre, pas un
+    simple recalcul) ET un usage retombé au plancher. Surveiller la bonne
+    fenêtre est essentiel : bloqué par l'hebdo, un rollover 5 h ne prouve rien.
+    """
     with state_lock:
+        if state["claude_unavailable_reason"] is None:
+            return
+        window = state["claude_unavailable_window"] or WINDOW_FIVE_HOUR
         old_reset = state["claude_unavailable_reset_at"]
-        if state["claude_unavailable_reason"] is None or used > CLAUDE_RECOVERED_PERCENT:
-            return
-        if old_reset and reset == old_reset:
-            return
+    used, reset = snapshot.window(window)
+    if used is None or used > CLAUDE_RECOVERED_PERCENT:
+        return
+    if old_reset and reset == old_reset:
+        return
+    with state_lock:
         state["preferred_engine"] = "claude"
         state["claude_unavailable_reason"] = None
         state["claude_unavailable_reset_at"] = None
-    journal("claude_restored", usage=used, reset_at=reset)
-    send("✅ Nouvelle fenêtre Claude détectée; Claude reprend les prochaines tâches.")
+        state["claude_unavailable_window"] = None
+    journal("claude_restored", usage=used, reset_at=reset, window=window)
+    send(f"✅ Nouvelle fenêtre Claude ({WINDOW_LABELS[window]}) détectée; "
+         "Claude reprend les prochaines tâches.")
     release_deferred_tasks()
 
 
+def blocking_window(snapshot: UsageSnapshot) -> str | None:
+    """Fenêtre au plafond, l'hebdomadaire d'abord : si les deux saturent, c'est
+    elle qui commande, car elle se libère en dernier."""
+    if snapshot.weekly is not None and snapshot.weekly >= CLAUDE_LIMIT_PERCENT:
+        return WINDOW_WEEKLY
+    if snapshot.used >= CLAUDE_LIMIT_PERCENT:
+        return WINDOW_FIVE_HOUR
+    return None
+
+
 def update_claude_usage() -> None:
-    used, reset, observed, age, last_error = load_claude_usage_snapshot()
+    snapshot = load_claude_usage_snapshot()
     with state_lock:
-        unchanged = state["claude_usage_observed_at"] == observed
-        state["claude_usage"] = used
-        state["claude_reset_at"] = reset
-        state["claude_usage_observed_at"] = observed
-        suffix = f"; dernière erreur: {last_error}" if last_error else ""
-        state["usage_monitor_status"] = f"actif (snapshot {age} s){suffix}"
+        unchanged = state["claude_usage_observed_at"] == snapshot.observed
+        state["claude_usage"] = snapshot.used
+        state["claude_reset_at"] = snapshot.reset
+        state["claude_weekly_usage"] = snapshot.weekly
+        state["claude_weekly_reset_at"] = snapshot.weekly_reset
+        state["claude_usage_observed_at"] = snapshot.observed
+        suffix = f"; dernière erreur: {snapshot.last_error}" if snapshot.last_error else ""
+        state["usage_monitor_status"] = f"actif (snapshot {snapshot.age} s){suffix}"
     if unchanged:
         return
-    journal("claude_usage", usage=used, reset_at=reset)
-    if used is not None and used >= CLAUDE_LIMIT_PERCENT:
-        mark_claude_unavailable("seuil 98 % atteint", used, reset)
-    elif used is not None:
-        restore_claude(used, reset)
+    journal("claude_usage", usage=snapshot.used, reset_at=snapshot.reset,
+            weekly=snapshot.weekly, weekly_reset_at=snapshot.weekly_reset)
+    window = blocking_window(snapshot)
+    if window:
+        used, reset = snapshot.window(window)
+        mark_claude_unavailable(
+            f"seuil 98 % atteint ({WINDOW_LABELS[window]})", used, reset, window)
+    else:
+        restore_claude(snapshot)
 
 
 def usage_monitor() -> None:
@@ -966,6 +1040,8 @@ def status_message() -> str:
         active = state["active_task_engine"] or "—"
         used = state["claude_usage"]
         reset = state["claude_reset_at"]
+        weekly = state["claude_weekly_usage"]
+        weekly_reset = state["claude_weekly_reset_at"]
         reason = state["claude_unavailable_reason"]
         codex_down = state["codex_unavailable_reason"]
         cwd = state["cwd"]
@@ -976,13 +1052,15 @@ def status_message() -> str:
             + ("Codex ✅" if state["codex_session_id"] else "Codex —")
         )
     usage = f"{used:.0f} %" if used is not None else "inconnu"
+    weekly_usage = f"{weekly:.0f} %" if weekly is not None else "inconnu"
     relay = "Claude disponible" if engine == "claude" else f"Codex actif ({reason or 'Claude indisponible'})"
     if codex_down:
         relay += f" · Codex en panne ({codex_down})"
     contexts = (f"Claude {claude_context() or '—'} · "
                 f"Codex {codex_context() or '—'}")
     return (f"📂 {cwd}\n🤖 prochaines tâches: {engine}\n⚙️ tâche en cours: {active}\n"
-            f"📊 Claude 5 h: {usage}\n⏱️ reset estimé: {format_reset(reset)}\n"
+            f"📊 Claude 5 h: {usage} · reset {format_reset(reset)}\n"
+            f"📅 Claude semaine: {weekly_usage} · reset {format_reset(weekly_reset)}\n"
             f"🧠 contexte: {contexts}\n"
             f"🔁 relais: {relay}\n🧵 sessions: {sessions}\n🔎 sonde usage: {monitor}\n"
             f"⏳ file: {task_q.unfinished_tasks} · différées: {deferred_q.qsize()}\n"
