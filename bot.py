@@ -42,6 +42,8 @@ LOG = os.path.join(BASE, "logs", "bot.log")
 JOURNAL = os.path.join(STATE_DIR, "relay-journal.jsonl")
 HANDOFF_FILE = os.path.join(STATE_DIR, "handoff.md")
 CODEX_LAST_MESSAGE = os.path.join(STATE_DIR, "codex-last-message.txt")
+PHOTO_DIR = os.path.join(STATE_DIR, "photos")
+PHOTO_RETENTION_S = 14 * 86400  # les images téléchargées au-delà sont purgées
 REPOS_BASE = "/root/repos"
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -957,6 +959,58 @@ def handle_voice(voice: dict[str, Any]) -> str:
     return text
 
 
+def _prune_photos() -> None:
+    """Supprime les images téléchargées il y a plus de PHOTO_RETENTION_S."""
+    cutoff = time.time() - PHOTO_RETENTION_S
+    try:
+        entries = list(Path(PHOTO_DIR).iterdir())
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:
+            pass
+
+
+def extract_media(msg: dict[str, Any]) -> tuple[str, str] | None:
+    """(file_id, extension par défaut) de l'image du message, ou None.
+
+    Une photo Telegram arrive comme une liste de tailles (la dernière est la
+    plus grande) ; une image envoyée « en fichier » arrive comme `document`
+    avec un `mime_type` `image/*`.
+    """
+    photos = msg.get("photo")
+    if photos:
+        return photos[-1]["file_id"], ".jpg"
+    doc = msg.get("document")
+    if doc and str(doc.get("mime_type", "")).startswith("image/"):
+        ext = os.path.splitext(doc.get("file_name", ""))[1] or ".jpg"
+        return doc["file_id"], ext
+    return None
+
+
+def download_media(file_id: str, default_ext: str = ".jpg") -> str:
+    """Télécharge un fichier Telegram dans PHOTO_DIR et renvoie son chemin absolu.
+
+    Contrairement à `download_voice`, on garde le fichier : la tâche est traitée
+    de façon asynchrone par le worker (Claude/Codex le lit ensuite via Read)."""
+    info = api("getFile", {"file_id": file_id}, timeout=20)
+    if not info.get("ok"):
+        raise RuntimeError(f"[getFile] ok=false: {str(info)[:200]}")
+    remote = info["result"]["file_path"]
+    ext = os.path.splitext(remote)[1] or default_ext
+    Path(PHOTO_DIR).mkdir(parents=True, exist_ok=True)
+    _prune_photos()
+    dest = os.path.join(PHOTO_DIR, f"{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}")
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{remote}"
+    with urllib.request.urlopen(url, timeout=60) as response, open(dest, "wb") as f:
+        f.write(response.read())
+    log(f"media saved {dest}")
+    return dest
+
+
 def _tail_lines(path: str, max_bytes: int = 262_144) -> list[str]:
     """Dernières lignes d'un fichier sans le lire en entier (transcripts longs)."""
     try:
@@ -1149,9 +1203,22 @@ def enqueue_task(text: str) -> None:
 
 
 def handle_message(msg: dict[str, Any]) -> None:
-    text = msg.get("text", "") or ""
+    text = msg.get("text", "") or msg.get("caption", "") or ""
     if not text and msg.get("voice"):
         text = handle_voice(msg["voice"])
+    media = extract_media(msg)
+    if media:
+        try:
+            path = download_media(*media)
+        except Exception as exc:
+            log(f"media error: {exc}")
+            send(f"❌ Téléchargement de l'image échoué : {exc}")
+        else:
+            send("🖼️ Image reçue, je la regarde.")
+            note = (f"[Image jointe via Telegram, enregistrée sur le serveur : "
+                    f"{path} — ouvre-la avec ton outil Read pour la voir.]")
+            enqueue_task(f"{text.strip()}\n\n{note}".strip())
+        return
     if not text.strip():
         return
     low = text.strip().lower()

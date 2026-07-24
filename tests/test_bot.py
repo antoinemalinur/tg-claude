@@ -558,5 +558,64 @@ class ContextAndPersistenceTests(unittest.TestCase):
         self.assertEqual(bot.state["cwd"], "/root/repos")
 
 
+class MediaTests(unittest.TestCase):
+    """Photos Telegram → tâche portant le chemin du fichier pour Read."""
+
+    def setUp(self) -> None:
+        while not bot.task_q.empty():
+            bot.task_q.get_nowait()
+        with bot.state_lock:
+            bot.state["cwd"] = "/root/repos"
+
+    def test_extract_media_prefers_the_largest_photo(self) -> None:
+        msg = {"photo": [{"file_id": "small"}, {"file_id": "big"}]}
+        self.assertEqual(bot.extract_media(msg), ("big", ".jpg"))
+
+    def test_extract_media_accepts_an_image_document(self) -> None:
+        msg = {"document": {"file_id": "doc1", "mime_type": "image/png",
+                            "file_name": "carte.png"}}
+        self.assertEqual(bot.extract_media(msg), ("doc1", ".png"))
+
+    def test_extract_media_ignores_a_non_image_document(self) -> None:
+        msg = {"document": {"file_id": "d", "mime_type": "application/pdf",
+                            "file_name": "x.pdf"}}
+        self.assertIsNone(bot.extract_media(msg))
+
+    def test_extract_media_is_none_for_plain_text(self) -> None:
+        self.assertIsNone(bot.extract_media({"text": "bonjour"}))
+
+    def test_photo_task_carries_the_path_and_the_caption(self) -> None:
+        msg = {"photo": [{"file_id": "big"}], "caption": "regarde ce point"}
+        with mock.patch.object(bot, "download_media", return_value="/tmp/p/img.jpg") as dl, \
+             mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"), \
+             mock.patch.object(bot, "git_state", return_value=""), \
+             mock.patch.object(bot, "engine_for_next_task", return_value="claude"):
+            bot.handle_message(msg)
+        dl.assert_called_once_with("big", ".jpg")
+        task = bot.task_q.get_nowait()
+        self.assertIn("/tmp/p/img.jpg", task["text"])
+        self.assertIn("regarde ce point", task["text"])
+
+    def test_photo_without_caption_still_enqueues_the_path(self) -> None:
+        msg = {"photo": [{"file_id": "big"}]}
+        with mock.patch.object(bot, "download_media", return_value="/tmp/p/img.jpg"), \
+             mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"), \
+             mock.patch.object(bot, "git_state", return_value=""), \
+             mock.patch.object(bot, "engine_for_next_task", return_value="claude"):
+            bot.handle_message(msg)
+        task = bot.task_q.get_nowait()
+        self.assertIn("/tmp/p/img.jpg", task["text"])
+        self.assertTrue(task["text"].strip())
+
+    def test_failed_download_notifies_and_enqueues_nothing(self) -> None:
+        msg = {"photo": [{"file_id": "big"}], "caption": "x"}
+        with mock.patch.object(bot, "download_media", side_effect=RuntimeError("boom")), \
+             mock.patch.object(bot, "journal"), \
+             mock.patch.object(bot, "send") as send:
+            bot.handle_message(msg)
+        self.assertTrue(bot.task_q.empty())
+        self.assertTrue(any("échoué" in call.args[0] for call in send.call_args_list))
+
+
 if __name__ == "__main__":
     unittest.main()
