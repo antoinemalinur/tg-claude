@@ -54,7 +54,7 @@ GROQ_MODEL = "whisper-large-v3"
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
 
 ALLOWED_TOOLS = [
-    "Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebSearch",
+    "Agent", "Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebSearch",
     "WebFetch", "TodoWrite", "NotebookEdit", "mcp__composio",
 ]
 CLAUDE_TIMEOUT = 1800
