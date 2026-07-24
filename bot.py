@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -59,6 +60,20 @@ ALLOWED_TOOLS = [
 ]
 CLAUDE_TIMEOUT = 1800
 CODEX_TIMEOUT = 1800
+# Telegram découpe les longs textes autour de 4096 caractères. On attend un
+# court silence afin que tous les fragments deviennent une seule tâche, sans
+# pour autant laisser un utilisateur qui envoie des messages en continu
+# repousser indéfiniment son lancement.
+MESSAGE_BATCH_QUIET_SECONDS = max(
+    0.5, float(os.environ.get("MESSAGE_BATCH_QUIET_SECONDS", "4"))
+)
+MESSAGE_BATCH_MAX_SECONDS = max(
+    MESSAGE_BATCH_QUIET_SECONDS,
+    float(os.environ.get("MESSAGE_BATCH_MAX_SECONDS", "15")),
+)
+TELEGRAM_SPLIT_THRESHOLD = 3500
+STOP_GRACE_SECONDS = 3.0
+TASK_CANCELLED = "__TG_CLAUDE_TASK_CANCELLED__"
 # Relecture du snapshot local (aucun appel réseau). La sonde Anthropic, elle,
 # tourne dans claude-usage-monitor : c'est elle qui doit rester espacée.
 USAGE_POLL_SECONDS = 120
@@ -160,6 +175,15 @@ state: dict[str, Any] = {
 state_lock = threading.RLock()
 task_q: queue.Queue[dict[str, Any]] = queue.Queue()
 deferred_q: queue.Queue[dict[str, Any]] = queue.Queue()
+message_batch_lock = threading.RLock()
+message_batch_parts: list[str] = []
+message_batch_started_at: float | None = None
+message_batch_cwd: str | None = None
+message_batch_timer: threading.Timer | None = None
+message_batch_generation = 0
+active_process_lock = threading.RLock()
+active_process: subprocess.Popen[str] | None = None
+active_process_cancelled = False
 
 
 def log(msg: str) -> None:
@@ -656,21 +680,84 @@ def mark_codex_unavailable(reason: str) -> None:
         send(f"⚠️ Codex indisponible ({reason}). Relais → Claude.")
 
 
+def _signal_process_group(process: subprocess.Popen[str], sig: int) -> None:
+    """Signale le CLI et tous les outils qu'il a lancés."""
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _force_kill_if_running(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        _signal_process_group(process, signal.SIGKILL)
+
+
+def stop_active_process() -> str | None:
+    """Demande l'arrêt de la tâche active et renvoie son moteur."""
+    global active_process_cancelled
+    with active_process_lock:
+        process = active_process
+        if process is None or process.poll() is not None:
+            return None
+        active_process_cancelled = True
+        with state_lock:
+            engine = state["active_task_engine"] or "agent"
+        _signal_process_group(process, signal.SIGTERM)
+        killer = threading.Timer(STOP_GRACE_SECONDS, _force_kill_if_running, args=(process,))
+        killer.daemon = True
+        killer.start()
+    journal("task_stop_requested", engine=engine, pid=process.pid)
+    return str(engine)
+
+
 def run_process(args: list[str], cwd: str, timeout: int,
                 stdin_path: str | None = None) -> tuple[bool, str, str]:
+    global active_process, active_process_cancelled
     stream = None
+    process = None
+    stdout = ""
+    stderr = ""
+    timed_out = False
+    cancelled = False
     try:
         stream = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
-        process = subprocess.run(args, cwd=cwd, env=dict(os.environ), capture_output=True,
-                                 text=True, timeout=timeout, stdin=stream)
-    except subprocess.TimeoutExpired:
-        return False, "", "tâche expirée (>30 min)"
+        process = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=dict(os.environ),
+            stdin=stream,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        with active_process_lock:
+            active_process = process
+            active_process_cancelled = False
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _signal_process_group(process, signal.SIGKILL)
+            stdout, stderr = process.communicate()
     except OSError as exc:
         return False, "", str(exc)
     finally:
+        if process is not None:
+            with active_process_lock:
+                if active_process is process:
+                    cancelled = active_process_cancelled
+                    active_process = None
+                    active_process_cancelled = False
         if hasattr(stream, "close"):
             stream.close()
-    stdout, stderr = (process.stdout or "").strip(), (process.stderr or "").strip()
+    stdout, stderr = (stdout or "").strip(), (stderr or "").strip()
+    if cancelled:
+        return False, stdout, TASK_CANCELLED
+    if timed_out:
+        return False, stdout, "tâche expirée (>30 min)"
+    assert process is not None
     return process.returncode == 0, stdout, stderr
 
 
@@ -835,6 +922,14 @@ def run_task(task: dict[str, Any]) -> None:
     typing()
     ok, out, err = run_engine(engine, task, "changement de moteur entre deux messages")
 
+    # Une annulation demandée par /stop est volontaire : elle ne doit être ni
+    # présentée comme une panne, ni rejouée automatiquement sur l'autre moteur.
+    if not ok and err == TASK_CANCELLED:
+        with state_lock:
+            state["active_task_engine"] = None
+        journal("task_cancelled", engine=engine, text=truncate(task["text"]), cwd=task["cwd"])
+        return
+
     # Panne de quota en pleine tâche : on bascule sur l'autre moteur, dans les
     # deux sens, en lui passant la passation avec l'échec dedans.
     if not ok:
@@ -857,6 +952,9 @@ def run_task(task: dict[str, Any]) -> None:
 
     with state_lock:
         state["active_task_engine"] = None
+    if not ok and err == TASK_CANCELLED:
+        journal("task_cancelled", engine=engine, text=truncate(task["text"]), cwd=task["cwd"])
+        return
     if not ok:
         journal("task_error", engine=engine, error=truncate(err or out), cwd=task["cwd"])
         if engine == "codex":
@@ -1127,13 +1225,20 @@ def handle_command(text: str) -> None:
     if cmd in ("/help", "/start"):
         send("🤖 Pont Claude ↔ Codex\n\n"
              "• Écris un message → Claude traite par défaut; Codex prend le relais à 98 % d’usage Claude.\n"
-             "• /cd <chemin>, /ls, /pwd, /new\n"
+             "• /cd <chemin>, /ls, /pwd, /new, /stop\n"
              "• /opus /sonnet /haiku /fable [message] — modèle Claude\n"
              "• /model — modèle Claude; /status — relais et quota\n"
              "• 🎙️ Vocal → transcription Groq puis tâche.\n\n"
              "Une tâche lancée n’est jamais interrompue par un basculement.")
     elif cmd == "/pwd":
         send(f"📂 {state['cwd']}")
+    elif cmd == "/stop":
+        engine = stop_active_process()
+        if engine:
+            label = "Claude" if engine == "claude" else "Codex" if engine == "codex" else engine
+            send(f"🛑 Arrêt demandé à {label}. Tu peux envoyer le prompt corrigé.")
+        else:
+            send("ℹ️ Aucune tâche Claude ou Codex n’est en cours.")
     elif cmd == "/cd":
         with state_lock:
             new_path = arg if arg.startswith("/") else os.path.join(state["cwd"], arg)
@@ -1192,9 +1297,103 @@ def handle_command(text: str) -> None:
         send(f"❓ Commande inconnue : {cmd}. /help")
 
 
-def enqueue_task(text: str) -> None:
-    with state_lock:
-        cwd = state["cwd"]
+def combine_message_fragments(parts: list[str]) -> str:
+    """Reconstruit un prompt Telegram, en distinguant coupure et paragraphes.
+
+    Un fragment proche de 4096 caractères a vraisemblablement été coupé par
+    Telegram : aucun caractère artificiel ne doit être inséré à sa frontière.
+    Des messages plus courts sont des ajouts volontaires et restent séparés.
+    """
+    if not parts:
+        return ""
+    combined = parts[0]
+    for previous, current in zip(parts, parts[1:]):
+        separator = "" if len(previous) >= TELEGRAM_SPLIT_THRESHOLD else "\n\n"
+        combined += separator + current
+    return combined.strip()
+
+
+def flush_message_batch(expected_generation: int | None = None) -> int:
+    """Transforme atomiquement les fragments en une tâche unique.
+
+    ``expected_generation`` empêche un ancien Timer annulé mais déjà réveillé
+    de vider prématurément un lot plus récent.
+    """
+    global message_batch_started_at, message_batch_cwd, message_batch_timer
+    global message_batch_generation
+    with message_batch_lock:
+        if expected_generation is not None and expected_generation != message_batch_generation:
+            return 0
+        if not message_batch_parts:
+            return 0
+        parts = list(message_batch_parts)
+        cwd = message_batch_cwd
+        started_at = message_batch_started_at or time.monotonic()
+        message_batch_parts.clear()
+        if message_batch_timer is not None:
+            message_batch_timer.cancel()
+        message_batch_timer = None
+        message_batch_started_at = None
+        message_batch_cwd = None
+        message_batch_generation += 1
+
+    text = combine_message_fragments(parts)
+    waited = max(0.0, time.monotonic() - started_at)
+    journal("message_batch", parts=len(parts), chars=len(text), wait_seconds=round(waited, 2))
+    if len(parts) > 1:
+        send(f"🧩 {len(parts)} messages assemblés en une seule demande.")
+    enqueue_task(text, cwd=cwd)
+    return len(parts)
+
+
+def buffer_message_fragment(text: str) -> None:
+    """Ajoute un texte au lot courant et repousse son envoi après le silence."""
+    global message_batch_started_at, message_batch_cwd, message_batch_timer
+    global message_batch_generation
+    if not text.strip():
+        return
+    now = time.monotonic()
+    with message_batch_lock:
+        if not message_batch_parts:
+            message_batch_started_at = now
+            with state_lock:
+                message_batch_cwd = state["cwd"]
+        message_batch_parts.append(text)
+        if message_batch_timer is not None:
+            message_batch_timer.cancel()
+        message_batch_generation += 1
+        generation = message_batch_generation
+        age = now - (message_batch_started_at or now)
+        delay = min(
+            MESSAGE_BATCH_QUIET_SECONDS,
+            max(0.0, MESSAGE_BATCH_MAX_SECONDS - age),
+        )
+        timer = threading.Timer(delay, flush_message_batch, args=(generation,))
+        timer.daemon = True
+        message_batch_timer = timer
+    timer.start()
+
+
+def cancel_message_batch() -> int:
+    """Annule proprement le lot en mémoire, principalement pour les tests."""
+    global message_batch_started_at, message_batch_cwd, message_batch_timer
+    global message_batch_generation
+    with message_batch_lock:
+        count = len(message_batch_parts)
+        message_batch_parts.clear()
+        if message_batch_timer is not None:
+            message_batch_timer.cancel()
+        message_batch_timer = None
+        message_batch_started_at = None
+        message_batch_cwd = None
+        message_batch_generation += 1
+    return count
+
+
+def enqueue_task(text: str, *, cwd: str | None = None) -> None:
+    if cwd is None:
+        with state_lock:
+            cwd = state["cwd"]
     task = {"id": str(uuid.uuid4()), "text": text, "cwd": cwd, "queued_at": time.time()}
     journal("message", text=truncate(text), cwd=cwd, git=git_state(cwd), next_engine=engine_for_next_task())
     if task_q.unfinished_tasks:
@@ -1208,6 +1407,9 @@ def handle_message(msg: dict[str, Any]) -> None:
         text = handle_voice(msg["voice"])
     media = extract_media(msg)
     if media:
+        # Une image forme une tâche explicite : les textes antérieurs doivent
+        # partir avant elle, jamais être inversés par le Timer du lot.
+        flush_message_batch()
         try:
             path = download_media(*media)
         except Exception as exc:
@@ -1226,9 +1428,13 @@ def handle_message(msg: dict[str, Any]) -> None:
         write_decision("allow" if low in CONFIRM_WORDS else "deny")
         send("✅ Reçu — j'autorise." if low in CONFIRM_WORDS else "⛔ Reçu — j'annule.")
     elif text.strip().startswith("/"):
+        # /stop est urgent et ne doit pas expédier un brouillon en cours. Les
+        # autres commandes forment une frontière : on vide d'abord le texte.
+        if text.strip().split(maxsplit=1)[0].lower() != "/stop":
+            flush_message_batch()
         handle_command(text)
     else:
-        enqueue_task(text)
+        buffer_message_fragment(text)
 
 
 def drain_backlog() -> int | None:

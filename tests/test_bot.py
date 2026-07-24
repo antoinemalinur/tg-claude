@@ -617,5 +617,119 @@ class MediaTests(unittest.TestCase):
         self.assertTrue(any("échoué" in call.args[0] for call in send.call_args_list))
 
 
+class MessageBatchTests(unittest.TestCase):
+    """Les fragments Telegram successifs ne doivent lancer qu'une tâche."""
+
+    def setUp(self) -> None:
+        bot.cancel_message_batch()
+        bot.task_q = bot.queue.Queue()
+        with bot.state_lock:
+            bot.state["cwd"] = "/root/repos/office-chess"
+
+    def tearDown(self) -> None:
+        bot.cancel_message_batch()
+
+    def flush(self) -> dict[str, object]:
+        with mock.patch.object(bot, "journal"), mock.patch.object(bot, "send"), \
+             mock.patch.object(bot, "git_state", return_value=""), \
+             mock.patch.object(bot, "engine_for_next_task", return_value="claude"):
+            bot.flush_message_batch()
+        return bot.task_q.get_nowait()
+
+    def test_successive_messages_are_buffered_as_one_task(self) -> None:
+        bot.buffer_message_fragment("Première partie")
+        bot.buffer_message_fragment("Deuxième partie")
+        self.assertTrue(bot.task_q.empty())
+        task = self.flush()
+        self.assertEqual(task["text"], "Première partie\n\nDeuxième partie")
+        self.assertEqual(task["cwd"], "/root/repos/office-chess")
+        self.assertTrue(bot.task_q.empty())
+
+    def test_telegram_sized_fragment_is_rejoined_without_extra_text(self) -> None:
+        first = "x" * 4096
+        bot.buffer_message_fragment(first)
+        bot.buffer_message_fragment("suite")
+        task = self.flush()
+        self.assertEqual(task["text"], first + "suite")
+
+    def test_stale_timer_cannot_flush_a_newer_batch(self) -> None:
+        bot.buffer_message_fragment("un")
+        stale_generation = bot.message_batch_generation
+        bot.buffer_message_fragment("deux")
+        with mock.patch.object(bot, "enqueue_task") as enqueue:
+            self.assertEqual(bot.flush_message_batch(stale_generation), 0)
+        enqueue.assert_not_called()
+        task = self.flush()
+        self.assertEqual(task["text"], "un\n\ndeux")
+
+    def test_plain_handle_message_uses_the_buffer(self) -> None:
+        with mock.patch.object(bot, "pending_exists", return_value=False), \
+             mock.patch.object(bot, "buffer_message_fragment") as buffered:
+            bot.handle_message({"text": "fragment"})
+        buffered.assert_called_once_with("fragment")
+
+    def test_stop_does_not_flush_a_prompt_being_corrected(self) -> None:
+        bot.buffer_message_fragment("brouillon")
+        with mock.patch.object(bot, "stop_active_process", return_value="claude"), \
+             mock.patch.object(bot, "flush_message_batch") as flush, \
+             mock.patch.object(bot, "send"):
+            bot.handle_message({"text": "/stop"})
+        flush.assert_not_called()
+        self.assertEqual(bot.message_batch_parts, ["brouillon"])
+
+
+class StopTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with bot.active_process_lock:
+            bot.active_process = None
+            bot.active_process_cancelled = False
+
+    def test_stop_command_reports_the_interrupted_engine(self) -> None:
+        with mock.patch.object(bot, "stop_active_process", return_value="claude"), \
+             mock.patch.object(bot, "send") as send:
+            bot.handle_command("/stop")
+        self.assertIn("Claude", send.call_args.args[0])
+
+    def test_cancelled_task_is_not_rerouted_or_reported_as_an_error(self) -> None:
+        task = {"text": "mauvais prompt", "cwd": "/root/repos"}
+        with bot.state_lock:
+            bot.state.update({"preferred_engine": "claude", "last_engine": None})
+        with mock.patch.object(bot, "run_claude",
+                               return_value=(False, "", bot.TASK_CANCELLED)), \
+             mock.patch.object(bot, "run_codex") as codex, \
+             mock.patch.object(bot, "journal") as journal, \
+             mock.patch.object(bot, "git_state", return_value=""), \
+             mock.patch.object(bot, "send") as send, \
+             mock.patch.object(bot, "typing"):
+            bot.run_task(task)
+        codex.assert_not_called()
+        send.assert_not_called()
+        self.assertTrue(any(call.args[0] == "task_cancelled"
+                            for call in journal.call_args_list))
+
+    def test_run_process_marks_a_user_stop_as_cancelled(self) -> None:
+        class FakeProcess:
+            pid = 1234
+            returncode = -bot.signal.SIGTERM
+            stopped = False
+
+            def poll(self):
+                return self.returncode if self.stopped else None
+
+            def communicate(self, timeout=None):
+                bot.stop_active_process()
+                self.stopped = True
+                return "", "terminated"
+
+        fake = FakeProcess()
+        with mock.patch.object(bot.subprocess, "Popen", return_value=fake), \
+             mock.patch.object(bot, "_signal_process_group"), \
+             mock.patch.object(bot.threading, "Timer") as timer:
+            timer.return_value.daemon = False
+            ok, _, error = bot.run_process(["claude"], "/root/repos", 30)
+        self.assertFalse(ok)
+        self.assertEqual(error, bot.TASK_CANCELLED)
+
+
 if __name__ == "__main__":
     unittest.main()
