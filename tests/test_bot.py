@@ -576,10 +576,15 @@ class ContextAndPersistenceTests(unittest.TestCase):
         self.assertIn("🧠 contexte: Claude — · Codex —", bot.status_message())
 
     def test_sessions_survive_restart(self) -> None:
+        # restore_persisted_state() n'accepte un cwd persisté que s'il désigne un
+        # dossier réel. Le test doit donc en fournir un qui existe vraiment,
+        # sinon il ne passe que sur une machine possédant /root/repos.
+        workdir = str(Path(self.temp.name) / "repos")
+        Path(workdir).mkdir()
         with bot.state_lock:
             bot.state.update({"claude_session_id": "abc-123",
                               "codex_session_id": "def-456",
-                              "last_engine": "claude", "cwd": "/root/repos"})
+                              "last_engine": "claude", "cwd": workdir})
         for key in bot.PERSISTED_KEYS:
             bot.persist_state_key(key)
         with bot.state_lock:  # simule le redémarrage du service
@@ -589,7 +594,7 @@ class ContextAndPersistenceTests(unittest.TestCase):
         self.assertEqual(bot.state["claude_session_id"], "abc-123")
         self.assertEqual(bot.state["codex_session_id"], "def-456")
         self.assertEqual(bot.state["last_engine"], "claude")
-        self.assertEqual(bot.state["cwd"], "/root/repos")
+        self.assertEqual(bot.state["cwd"], workdir)
 
     def test_cleared_session_is_not_resurrected(self) -> None:
         with bot.state_lock:
