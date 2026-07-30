@@ -58,8 +58,9 @@ ALLOWED_TOOLS = [
     "Agent", "Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebSearch",
     "WebFetch", "TodoWrite", "NotebookEdit", "mcp__composio",
 ]
-CLAUDE_TIMEOUT = 1800
-CODEX_TIMEOUT = 1800
+# Aucune limite de durée murale : certaines analyses, compilations et
+# simulations légitimes dépassent 30 minutes. Le worker attend la fin réelle
+# du moteur; /stop reste le mécanisme explicite et immédiat d'annulation.
 # Telegram découpe les longs textes autour de 4096 caractères. On attend un
 # court silence afin que tous les fragments deviennent une seule tâche, sans
 # pour autant laisser un utilisateur qui envoie des messages en continu
@@ -98,13 +99,22 @@ CLAUDE_USAGE_STATE = os.environ.get(
 
 # (id API, libellé, fenêtre de contexte en tokens — docs Anthropic 07/2026)
 MODELS = {
-    "opus": ("claude-opus-4-8", "Opus 4.8", 1_000_000),
+    "opus": ("opus", "Opus 4.8", 1_000_000),
     "sonnet": ("claude-sonnet-5", "Sonnet 5", 1_000_000),
     "haiku": ("claude-haiku-4-5-20251001", "Haiku 4.5", 200_000),
     "fable": ("claude-fable-5", "Fable 5", 1_000_000),
 }
 DEFAULT_MODEL = "opus"
 MODEL_FILE = os.path.join(STATE_DIR, "model")
+
+# Niveaux séparés : Claude reste économe par défaut, tandis que Codex utilise
+# l'avant-dernier niveau de GPT-5.6 Sol (max, juste avant ultra).
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+DEFAULT_CLAUDE_EFFORT = "medium"
+DEFAULT_CODEX_EFFORT = "max"
+CLAUDE_EFFORT_FILE = os.path.join(STATE_DIR, "claude-effort")
+CODEX_EFFORT_FILE = os.path.join(STATE_DIR, "codex-effort")
 
 # Transcripts des sessions natives : c'est là (et seulement là) que vivent les
 # compteurs de contexte — le CLI Claude n'expose rien en sortie texte, et le
@@ -156,6 +166,8 @@ state: dict[str, Any] = {
     "claude_session_id": None,
     "codex_session_id": None,
     "model": DEFAULT_MODEL,
+    "claude_effort": DEFAULT_CLAUDE_EFFORT,
+    "codex_effort": DEFAULT_CODEX_EFFORT,
     "preferred_engine": "claude",
     "codex_unavailable_reason": None,
     "codex_unavailable_at": None,
@@ -257,6 +269,21 @@ def save_model(model: str) -> None:
         Path(MODEL_FILE).write_text(model, encoding="utf-8")
     except OSError as exc:
         log(f"model save error: {exc}")
+
+
+def load_effort(path: str, allowed: tuple[str, ...], default: str) -> str:
+    try:
+        effort = Path(path).read_text(encoding="utf-8").strip()
+        return effort if effort in allowed else default
+    except OSError:
+        return default
+
+
+def save_effort(path: str, effort: str) -> None:
+    try:
+        Path(path).write_text(effort, encoding="utf-8")
+    except OSError as exc:
+        log(f"effort save error: {exc}")
 
 
 def _state_file(key: str) -> Path:
@@ -711,14 +738,13 @@ def stop_active_process() -> str | None:
     return str(engine)
 
 
-def run_process(args: list[str], cwd: str, timeout: int,
+def run_process(args: list[str], cwd: str,
                 stdin_path: str | None = None) -> tuple[bool, str, str]:
     global active_process, active_process_cancelled
     stream = None
     process = None
     stdout = ""
     stderr = ""
-    timed_out = False
     cancelled = False
     try:
         stream = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
@@ -735,12 +761,7 @@ def run_process(args: list[str], cwd: str, timeout: int,
         with active_process_lock:
             active_process = process
             active_process_cancelled = False
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _signal_process_group(process, signal.SIGKILL)
-            stdout, stderr = process.communicate()
+        stdout, stderr = process.communicate()
     except OSError as exc:
         return False, "", str(exc)
     finally:
@@ -755,8 +776,6 @@ def run_process(args: list[str], cwd: str, timeout: int,
     stdout, stderr = (stdout or "").strip(), (stderr or "").strip()
     if cancelled:
         return False, stdout, TASK_CANCELLED
-    if timed_out:
-        return False, stdout, "tâche expirée (>30 min)"
     assert process is not None
     return process.returncode == 0, stdout, stderr
 
@@ -766,6 +785,7 @@ def run_claude(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, st
     with state_lock:
         session_id = state["claude_session_id"]
         model = state["model"]
+        effort = state["claude_effort"]
         if not session_id:
             session_id = str(uuid.uuid4())
             state["claude_session_id"] = session_id
@@ -774,7 +794,8 @@ def run_claude(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, st
             resume = True
     persist_state_key("claude_session_id")
     args = ["claude", "-p", prompt, "--allowedTools", *ALLOWED_TOOLS,
-            "--settings", SETTINGS, "--model", MODELS[model][0]]
+            "--settings", SETTINGS, "--model", MODELS[model][0],
+            "--effort", effort]
     args += ["--resume", session_id] if resume else ["--session-id", session_id]
     # Le contexte de passation entre par le prompt système, pas par la demande :
     # Claude sait ainsi que c'est du contexte et non un ordre d'Antoine.
@@ -782,7 +803,7 @@ def run_claude(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, st
         args += ["--append-system-prompt-file", handoff_path]
     log(f"claude cwd={task['cwd']} session={session_id} resume={resume} "
         f"handoff={bool(handoff_path)}")
-    ok, out, err = run_process(args, task["cwd"], CLAUDE_TIMEOUT)
+    ok, out, err = run_process(args, task["cwd"])
     if not ok and resume and is_stale_session(f"{out}\n{err}"):
         return retry_without_session("claude", task, handoff_path)
     return ok, out, err
@@ -850,9 +871,11 @@ def run_codex(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, str
     prompt = task_prompt("codex", task)
     with state_lock:
         session_id = state["codex_session_id"]
+        effort = state["codex_effort"]
     # Le VPS est déjà le périmètre explicitement confié au relais; le mode
     # autonome est requis pour ne pas bloquer un message Telegram sur un TTY.
     common = ["--model", CODEX_MODEL, "--json",
+              "-c", f'model_reasoning_effort="{effort}"',
               "--output-last-message", CODEX_LAST_MESSAGE,
               "--dangerously-bypass-approvals-and-sandbox",
               "--skip-git-repo-check"]
@@ -869,8 +892,7 @@ def run_codex(task: dict[str, Any], handoff_path: str | None) -> tuple[bool, str
     # justement prévue pour ça (elle arrive dans un bloc <stdin> distinct).
     log(f"codex cwd={task['cwd']} session={session_id or 'nouvelle'} "
         f"handoff={bool(handoff_path)}")
-    ok, stdout, stderr = run_process(args, task["cwd"], CODEX_TIMEOUT,
-                                     stdin_path=handoff_path)
+    ok, stdout, stderr = run_process(args, task["cwd"], stdin_path=handoff_path)
     thread_id = codex_thread_id(stdout)
     if thread_id:
         with state_lock:
@@ -968,8 +990,11 @@ def run_task(task: dict[str, Any]) -> None:
             cwd=task["cwd"], git=git_state(task["cwd"]))
     with state_lock:
         state["last_engine"] = engine
+        model_label = MODELS[state["model"]][1]
+        effort = state["claude_effort"] if engine == "claude" else state["codex_effort"]
     persist_state_key("last_engine")
-    footer = MODELS[state["model"]][1] if engine == "claude" else f"Codex · {CODEX_MODEL}"
+    footer = (f"{model_label} · effort:{effort}" if engine == "claude"
+              else f"Codex · {CODEX_MODEL} · effort:{effort}")
     send(f"{response}\n\n— 🤖 {footer}")
 
 
@@ -1198,6 +1223,9 @@ def status_message() -> str:
         codex_down = state["codex_unavailable_reason"]
         cwd = state["cwd"]
         monitor = state["usage_monitor_status"]
+        model_label = MODELS[state["model"]][1]
+        claude_effort = state["claude_effort"]
+        codex_effort = state["codex_effort"]
         sessions = (
             ("Claude ✅" if state["claude_session_id"] else "Claude —")
             + " · "
@@ -1210,7 +1238,9 @@ def status_message() -> str:
         relay += f" · Codex en panne ({codex_down})"
     contexts = (f"Claude {claude_context() or '—'} · "
                 f"Codex {codex_context() or '—'}")
-    return (f"📂 {cwd}\n🤖 prochaines tâches: {engine}\n⚙️ tâche en cours: {active}\n"
+    return (f"📂 {cwd}\n🤖 prochaines tâches: {engine}\n"
+            f"🧩 modèle: {model_label} · Claude {claude_effort} · Codex {codex_effort}\n"
+            f"⚙️ tâche en cours: {active}\n"
             f"📊 Claude 5 h: {usage} · reset {format_reset(reset)}\n"
             f"📅 Claude semaine: {weekly_usage} · reset {format_reset(weekly_reset)}\n"
             f"🧠 contexte: {contexts}\n"
@@ -1226,10 +1256,12 @@ def handle_command(text: str) -> None:
         send("🤖 Pont Claude ↔ Codex\n\n"
              "• Écris un message → Claude traite par défaut; Codex prend le relais à 98 % d’usage Claude.\n"
              "• /cd <chemin>, /ls, /pwd, /new, /stop\n"
-             "• /opus /sonnet /haiku /fable [message] — modèle Claude\n"
+             "• /opus /sonnet /haiku /fable [effort] [message] — modèle (+ effort)\n"
+             "• /effort [claude|codex] <niveau> — raisonnement\n"
              "• /model — modèle Claude; /status — relais et quota\n"
              "• 🎙️ Vocal → transcription Groq puis tâche.\n\n"
-             "Une tâche lancée n’est jamais interrompue par un basculement.")
+             "Une tâche lancée n’a aucune limite de durée; /stop est son seul "
+             "arrêt manuel.")
     elif cmd == "/pwd":
         send(f"📂 {state['cwd']}")
     elif cmd == "/stop":
@@ -1272,8 +1304,8 @@ def handle_command(text: str) -> None:
              "Le journal de relais est conservé.")
     elif cmd == "/model":
         if not arg:
-            send(f"🤖 Modèle Claude actuel : {MODELS[state['model']][1]}\n"
-                 f"Pour changer : /model <nom>\nDispo : {' · '.join(MODELS)}")
+            send(f"🤖 Modèle Claude : {MODELS[state['model']][1]} · effort {state['claude_effort']}\n"
+                 f"Pour changer : /model <nom> ou /opus <effort>\nDispo : {' · '.join(MODELS)}")
         elif arg.lower() in MODELS:
             with state_lock:
                 state["model"] = arg.lower()
@@ -1283,14 +1315,55 @@ def handle_command(text: str) -> None:
             send(f"❌ Modèle inconnu : {arg}\nDispo : {' · '.join(MODELS)}")
     elif cmd.lstrip("/") in MODELS:
         model = cmd.lstrip("/")
+        # /opus xhigh [message] : si le 1er mot est un niveau d'effort, on le
+        # consomme ; le reste (s'il y en a) redevient le message à traiter.
+        effort_set = None
+        if arg:
+            first, _, rest = arg.partition(" ")
+            if first.lower() in CLAUDE_EFFORTS:
+                effort_set = first.lower()
+                arg = rest.strip()
         with state_lock:
             state["model"] = model
             save_model(model)
+            if effort_set:
+                state["claude_effort"] = effort_set
+                save_effort(CLAUDE_EFFORT_FILE, effort_set)
+            effort = state["claude_effort"]
+        label = f"{MODELS[model][1]} · {effort}"
         if arg:
-            send(f"🤖 Claude → {MODELS[model][1]} · je traite ton message…")
+            send(f"🤖 Claude → {label} · je traite ton message…")
             enqueue_task(arg)
         else:
-            send(f"🤖 Modèle Claude → {MODELS[model][1]}.")
+            send(f"🤖 Modèle Claude → {label}.")
+    elif cmd == "/effort":
+        effort_parts = arg.lower().split()
+        if not effort_parts:
+            send(f"🧠 Claude : {state['claude_effort']} · Codex : {state['codex_effort']}\n"
+                 "Pour changer : /effort claude <niveau> ou /effort codex <niveau>")
+        elif len(effort_parts) == 1 and effort_parts[0] in CLAUDE_EFFORTS:
+            # Compatibilité avec l'ancienne commande : sans moteur, applique aux deux.
+            effort = effort_parts[0]
+            with state_lock:
+                state["claude_effort"] = effort
+                state["codex_effort"] = effort
+                save_effort(CLAUDE_EFFORT_FILE, effort)
+                save_effort(CODEX_EFFORT_FILE, effort)
+            send(f"🧠 Effort → {effort} (Claude & Codex, contexte conservé).")
+        elif len(effort_parts) == 2 and effort_parts[0] in ("claude", "codex"):
+            engine, effort = effort_parts
+            allowed = CLAUDE_EFFORTS if engine == "claude" else CODEX_EFFORTS
+            if effort not in allowed:
+                send(f"❌ Niveau {engine} inconnu : {effort}\nDispo : {' · '.join(allowed)}")
+                return
+            key = f"{engine}_effort"
+            path = CLAUDE_EFFORT_FILE if engine == "claude" else CODEX_EFFORT_FILE
+            with state_lock:
+                state[key] = effort
+                save_effort(path, effort)
+            send(f"🧠 Effort {engine.capitalize()} → {effort} (contexte conservé).")
+        else:
+            send("❌ Syntaxe : /effort [claude|codex] <niveau>")
     elif cmd == "/status":
         send(status_message())
     else:
@@ -1458,10 +1531,17 @@ def main() -> None:
         except FileNotFoundError:
             pass
     state["model"] = load_model()
+    state["claude_effort"] = load_effort(
+        CLAUDE_EFFORT_FILE, CLAUDE_EFFORTS, DEFAULT_CLAUDE_EFFORT
+    )
+    state["codex_effort"] = load_effort(
+        CODEX_EFFORT_FILE, CODEX_EFFORTS, DEFAULT_CODEX_EFFORT
+    )
     restore_persisted_state()
     threading.Thread(target=worker, daemon=True, name="relay-worker").start()
     threading.Thread(target=usage_monitor, daemon=True, name="claude-usage-monitor").start()
-    log(f"bot started (model={state['model']})")
+    log(f"bot started (model={state['model']} claude_effort={state['claude_effort']} "
+        f"codex_effort={state['codex_effort']})")
     offset = load_offset() or drain_backlog()
     send("🟢 Pont Claude ↔ Codex démarré. /help pour les commandes.")
     while True:
