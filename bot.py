@@ -123,9 +123,14 @@ CLAUDE_PROJECTS_DIR = os.environ.get("CLAUDE_PROJECTS_DIR", "/root/.claude/proje
 CODEX_SESSIONS_DIR = os.environ.get("CODEX_SESSIONS_DIR", "/root/.codex/sessions")
 CODEX_FALLBACK_WINDOW = 272_000
 
+ENGINES = ("claude", "codex")
+
 # Clés d'état qui survivent à un redémarrage du service : sans elles, chaque
-# déploiement perdait les sessions natives (et donc tout le contexte).
-PERSISTED_KEYS = ("claude_session_id", "codex_session_id", "last_engine", "cwd")
+# déploiement perdait les sessions natives (et donc tout le contexte). Une
+# épingle posée par /switch en fait partie : un redéploiement ne doit pas
+# renvoyer les tâches sur un moteur qu'on venait de quitter à la main.
+PERSISTED_KEYS = ("claude_session_id", "codex_session_id", "last_engine", "cwd",
+                  "manual_engine")
 
 CONFIRM_WORDS = {"confirme", "confirm", "oui", "yes", "ok", "y", "✅"}
 CANCEL_WORDS = {"annule", "cancel", "non", "no", "n", "❌", "stop"}
@@ -169,6 +174,8 @@ state: dict[str, Any] = {
     "claude_effort": DEFAULT_CLAUDE_EFFORT,
     "codex_effort": DEFAULT_CODEX_EFFORT,
     "preferred_engine": "claude",
+    # Moteur imposé à la main par /switch; None = le relais choisit seul.
+    "manual_engine": None,
     "codex_unavailable_reason": None,
     "codex_unavailable_at": None,
     "last_engine": None,
@@ -315,6 +322,10 @@ def restore_persisted_state() -> None:
         if not value:
             continue
         if key == "cwd" and not os.path.isdir(value):
+            continue
+        # Le fichier pilote le routage : un contenu inattendu est ignoré
+        # plutôt qu'imposé aux prochaines tâches.
+        if key == "manual_engine" and value not in ENGINES:
             continue
         with state_lock:
             state[key] = value
@@ -661,7 +672,26 @@ def usage_monitor() -> None:
         time.sleep(USAGE_POLL_SECONDS)
 
 
+def manual_engine_pin() -> str | None:
+    """Moteur épinglé par /switch, s'il est en état de travailler.
+
+    L'épingle est conservée même quand le moteur épinglé tombe : le relais
+    automatique assure l'intérim, et l'épingle reprend la main dès le retour du
+    moteur choisi. Sinon une panne de quota effacerait silencieusement un choix
+    explicite de l'utilisateur.
+    """
+    with state_lock:
+        engine = state["manual_engine"]
+    if engine is None:
+        return None
+    return engine if engine_available(engine) else None
+
+
 def engine_for_next_task() -> str:
+    # Un choix explicite passe avant le relais : c'est tout l'intérêt de /switch.
+    pinned = manual_engine_pin()
+    if pinned:
+        return pinned
     with state_lock:
         engine = state["preferred_engine"]
         # Si le moteur préféré est justement celui qui est à plat, on repart
@@ -939,10 +969,15 @@ def run_engine(engine: str, task: dict[str, Any], reason: str) -> tuple[bool, st
 
 def run_task(task: dict[str, Any]) -> None:
     engine = engine_for_next_task()
+    # Le motif part dans le fichier de passation : le moteur entrant mérite de
+    # savoir s'il prend la main sur ordre ou par défaillance de l'autre.
+    reason = ("bascule demandée à la main via /switch"
+              if manual_engine_pin() == engine
+              else "changement de moteur entre deux messages")
     journal("task_started", engine=engine, text=truncate(task["text"]), cwd=task["cwd"],
             git=git_state(task["cwd"]))
     typing()
-    ok, out, err = run_engine(engine, task, "changement de moteur entre deux messages")
+    ok, out, err = run_engine(engine, task, reason)
 
     # Une annulation demandée par /stop est volontaire : elle ne doit être ni
     # présentée comme une panne, ni rejouée automatiquement sur l'autre moteur.
@@ -1221,6 +1256,7 @@ def status_message() -> str:
         weekly_reset = state["claude_weekly_reset_at"]
         reason = state["claude_unavailable_reason"]
         codex_down = state["codex_unavailable_reason"]
+        pinned = state["manual_engine"]
         cwd = state["cwd"]
         monitor = state["usage_monitor_status"]
         model_label = MODELS[state["model"]][1]
@@ -1233,12 +1269,24 @@ def status_message() -> str:
         )
     usage = f"{used:.0f} %" if used is not None else "inconnu"
     weekly_usage = f"{weekly:.0f} %" if weekly is not None else "inconnu"
-    relay = "Claude disponible" if engine == "claude" else f"Codex actif ({reason or 'Claude indisponible'})"
+    if engine == "claude":
+        relay = "Claude disponible"
+    elif pinned == "codex":
+        # Sans ça, une épingle manuelle s'affichait comme une panne de Claude.
+        relay = "Codex actif (choix manuel)"
+    else:
+        relay = f"Codex actif ({reason or 'Claude indisponible'})"
     if codex_down:
         relay += f" · Codex en panne ({codex_down})"
     contexts = (f"Claude {claude_context() or '—'} · "
                 f"Codex {codex_context() or '—'}")
-    return (f"📂 {cwd}\n🤖 prochaines tâches: {engine}\n"
+    if not pinned:
+        routing = f"{engine} (relais automatique)"
+    elif pinned == engine:
+        routing = f"{engine} (épinglé via /switch)"
+    else:
+        routing = f"{engine} (intérim; épingle /switch sur {pinned} indisponible)"
+    return (f"📂 {cwd}\n🤖 prochaines tâches: {routing}\n"
             f"🧩 modèle: {model_label} · Claude {claude_effort} · Codex {codex_effort}\n"
             f"⚙️ tâche en cours: {active}\n"
             f"📊 Claude 5 h: {usage} · reset {format_reset(reset)}\n"
@@ -1255,6 +1303,8 @@ def handle_command(text: str) -> None:
     if cmd in ("/help", "/start"):
         send("🤖 Pont Claude ↔ Codex\n\n"
              "• Écris un message → Claude traite par défaut; Codex prend le relais à 98 % d’usage Claude.\n"
+             "• /switch claude|codex [message] — impose le moteur (contexte transmis); "
+             "/switch auto rend la main au relais.\n"
              "• /cd <chemin>, /ls, /pwd, /new, /stop\n"
              "• /opus /sonnet /haiku /fable [effort] [message] — modèle (+ effort)\n"
              "• /effort [claude|codex] <niveau> — raisonnement\n"
@@ -1364,6 +1414,55 @@ def handle_command(text: str) -> None:
             send(f"🧠 Effort {engine.capitalize()} → {effort} (contexte conservé).")
         else:
             send("❌ Syntaxe : /effort [claude|codex] <niveau>")
+    elif cmd == "/switch":
+        switch_parts = arg.split(maxsplit=1)
+        target = switch_parts[0].lower() if switch_parts else ""
+        message = switch_parts[1].strip() if len(switch_parts) > 1 else ""
+        if not target:
+            with state_lock:
+                pinned = state["manual_engine"]
+            engine = engine_for_next_task()
+            mode = (f"épinglé sur {pinned.capitalize()}" if pinned
+                    else "relais automatique")
+            send(f"🔀 Mode : {mode} · prochaines tâches → {engine.capitalize()}\n"
+                 "Syntaxe : /switch claude|codex [message] · /switch auto")
+        elif target in ("auto", "off"):
+            with state_lock:
+                previous = state["manual_engine"]
+                state["manual_engine"] = None
+            persist_state_key("manual_engine")
+            if previous:
+                journal("engine_unpinned", previous=previous)
+            engine = engine_for_next_task()
+            send("🔀 Relais automatique rétabli (plus d'épingle) · prochaines tâches "
+                 f"→ {engine.capitalize()}.")
+        elif target in ENGINES:
+            with state_lock:
+                previous = state["manual_engine"]
+                state["manual_engine"] = target
+            persist_state_key("manual_engine")
+            journal("engine_pinned", engine=target, previous=previous)
+            label = target.capitalize()
+            with state_lock:
+                started = state["last_engine"] is not None
+            if not engine_available(target):
+                note = (f"⚠️ {label} est indisponible pour l'instant : l'autre moteur "
+                        "assure l'intérim et l'épingle reprendra dès son retour.")
+            elif not started:
+                note = "Aucune conversation en cours à lui transmettre."
+            elif needs_handoff(target):
+                note = ("Le contexte de la conversation lui sera passé au démarrage "
+                        "de sa session (fichier de passation).")
+            else:
+                note = "Il tenait déjà la conversation : sa session native reprend telle quelle."
+            suffix = " · je traite ton message…" if message else ""
+            send(f"🔀 Prochaines tâches → {label} (épinglé; /switch auto pour rendre "
+                 f"la main au relais){suffix}\n{note}")
+            if message:
+                enqueue_task(message)
+        else:
+            send(f"❌ Moteur inconnu : {target}\n"
+                 "Syntaxe : /switch claude|codex [message] · /switch auto")
     elif cmd == "/status":
         send(status_message())
     else:

@@ -50,6 +50,7 @@ class RelayUsageTests(unittest.TestCase):
                 "claude_effort": bot.DEFAULT_CLAUDE_EFFORT,
                 "codex_effort": bot.DEFAULT_CODEX_EFFORT,
                 "preferred_engine": "claude",
+                "manual_engine": None,
                 "codex_unavailable_reason": None,
                 "codex_unavailable_at": None,
                 "last_engine": None,
@@ -348,6 +349,7 @@ class HandoffTests(unittest.TestCase):
                 "claude_session_id": None,
                 "codex_session_id": None,
                 "preferred_engine": "claude",
+                "manual_engine": None,
                 "codex_unavailable_reason": None,
                 "codex_unavailable_at": None,
                 "last_engine": None,
@@ -506,6 +508,152 @@ class HandoffTests(unittest.TestCase):
         self.assertLessEqual(len(document), handoff_module.MAX_TOTAL_CHARS)
 
 
+class ManualSwitchTests(unittest.TestCase):
+    """/switch impose le moteur à la main sans désarmer le relais automatique."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state_dir = Path(self.temp.name) / "state"
+        self.state_dir.mkdir()
+        for name, value in (("STATE_DIR", str(self.state_dir)),
+                            ("JOURNAL", str(Path(self.temp.name) / "journal.jsonl")),
+                            ("HANDOFF_FILE", str(Path(self.temp.name) / "handoff.md"))):
+            patch = mock.patch.object(bot, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with bot.state_lock:
+            bot.state.update({
+                "cwd": "/root/repos",
+                "claude_session_id": None,
+                "codex_session_id": None,
+                "preferred_engine": "claude",
+                "manual_engine": None,
+                "codex_unavailable_reason": None,
+                "codex_unavailable_at": None,
+                "claude_unavailable_reason": None,
+                "last_engine": None,
+                "active_task_engine": None,
+            })
+        # L'épingle est globale : la laisser fuiter réorienterait les autres tests.
+        self.addCleanup(bot.state.update, {"manual_engine": None})
+
+    def switch(self, arg: str = "") -> tuple[str, mock.Mock]:
+        """Joue /switch et rend le dernier message Telegram + le mock d'enfilement."""
+        with mock.patch.object(bot, "send") as send, \
+             mock.patch.object(bot, "enqueue_task") as enqueue:
+            bot.handle_command(f"/switch {arg}".strip())
+        return (send.call_args.args[0] if send.call_args else ""), enqueue
+
+    @property
+    def pin_file(self) -> Path:
+        return self.state_dir / "manual-engine"
+
+    def test_switch_codex_routes_the_next_tasks_to_codex(self) -> None:
+        message, _ = self.switch("codex")
+        self.assertEqual(bot.engine_for_next_task(), "codex")
+        # Le relais automatique n'est pas touché : il reprend au /switch auto.
+        self.assertEqual(bot.state["preferred_engine"], "claude")
+        self.assertIn("Codex", message)
+        self.assertEqual(self.pin_file.read_text(encoding="utf-8"), "codex")
+
+    def test_switch_auto_gives_the_relay_back(self) -> None:
+        self.switch("codex")
+        message, _ = self.switch("auto")
+        self.assertIsNone(bot.state["manual_engine"])
+        self.assertEqual(bot.engine_for_next_task(), "claude")
+        self.assertFalse(self.pin_file.exists())
+        self.assertIn("automatique", message)
+
+    def test_confirmation_only_promises_a_handoff_when_there_is_one(self) -> None:
+        with bot.state_lock:  # Codex tient déjà la conversation
+            bot.state.update({"last_engine": "codex", "codex_session_id": "t-1"})
+        self.assertIn("session native", self.switch("codex")[0])
+        self.assertIn("passation", self.switch("claude")[0])
+
+    def test_switch_can_carry_the_message_to_run(self) -> None:
+        _, enqueue = self.switch("codex corrige le parser")
+        enqueue.assert_called_once_with("corrige le parser")
+        self.assertEqual(bot.engine_for_next_task(), "codex")
+
+    def test_unknown_engine_changes_nothing(self) -> None:
+        message, enqueue = self.switch("gpt4")
+        self.assertIsNone(bot.state["manual_engine"])
+        enqueue.assert_not_called()
+        self.assertIn("inconnu", message)
+
+    def test_manual_switch_still_hands_over_the_context(self) -> None:
+        Path(bot.JOURNAL).write_text(
+            json.dumps({"kind": "message", "text": "découpe les balades"}) + "\n"
+            + json.dumps({"kind": "response", "engine": "claude",
+                          "text": "voici le plan"}) + "\n",
+            encoding="utf-8",
+        )
+        with bot.state_lock:
+            bot.state.update({"last_engine": "claude", "claude_session_id": "abc"})
+        self.switch("codex")
+        with mock.patch.object(bot, "run_codex", return_value=(True, "ok", "")) as codex, \
+             mock.patch.object(bot, "git_state", return_value="hors dépôt Git"), \
+             mock.patch.object(bot, "typing"), \
+             mock.patch.object(bot, "send"):
+            bot.run_task({"text": "continue", "cwd": "/root/repos"})
+        document = Path(codex.call_args.args[1]).read_text(encoding="utf-8")
+        self.assertIn("claude → codex", document)
+        self.assertIn("découpe les balades", document)
+        self.assertIn("voici le plan", document)
+        # Le moteur entrant doit savoir qu'il prend la main sur ordre, pas sur panne.
+        self.assertIn("/switch", document)
+
+    def test_a_pinned_engine_out_of_quota_yields_without_losing_the_pin(self) -> None:
+        self.switch("claude")
+        with mock.patch.object(bot, "send"):
+            bot.mark_claude_unavailable("quota 5 h")
+        self.assertEqual(bot.engine_for_next_task(), "codex")
+        self.assertEqual(bot.state["manual_engine"], "claude")
+        with bot.state_lock:  # nouvelle fenêtre détectée par le moniteur
+            bot.state["claude_unavailable_reason"] = None
+        self.assertEqual(bot.engine_for_next_task(), "claude")
+
+    def test_a_new_claude_window_does_not_steal_a_codex_pin(self) -> None:
+        with mock.patch.object(bot, "send"):
+            bot.mark_claude_unavailable("quota 5 h")
+        self.switch("codex")
+        with bot.state_lock:  # le moniteur rend la main à Claude de son côté
+            bot.state["preferred_engine"] = "claude"
+            bot.state["claude_unavailable_reason"] = None
+        self.assertEqual(bot.engine_for_next_task(), "codex")
+
+    def test_a_codex_outage_suspends_then_restores_the_pin(self) -> None:
+        self.switch("codex")
+        with mock.patch.object(bot, "send"):
+            bot.mark_codex_unavailable("erreur de quota Codex")
+        self.assertEqual(bot.engine_for_next_task(), "claude")
+        self.assertEqual(bot.state["manual_engine"], "codex")
+        with bot.state_lock:
+            bot.state["codex_unavailable_at"] = time.time() - bot.CODEX_RETRY_SECONDS - 1
+        self.assertEqual(bot.engine_for_next_task(), "codex")
+
+    def test_pin_survives_a_restart(self) -> None:
+        self.switch("codex")
+        with bot.state_lock:  # simule le redémarrage du service
+            bot.state["manual_engine"] = None
+        bot.restore_persisted_state()
+        self.assertEqual(bot.state["manual_engine"], "codex")
+
+    def test_corrupted_pin_file_is_ignored(self) -> None:
+        self.pin_file.write_text("gemini", encoding="utf-8")
+        bot.restore_persisted_state()
+        self.assertIsNone(bot.state["manual_engine"])
+
+    def test_status_names_the_pinned_engine(self) -> None:
+        self.switch("codex")
+        with mock.patch.object(bot, "claude_context", return_value=None), \
+             mock.patch.object(bot, "codex_context", return_value=None):
+            message = bot.status_message()
+        self.assertIn("épinglé via /switch", message)
+        self.assertIn("choix manuel", message)
+
+
 class ContextAndPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -526,7 +674,7 @@ class ContextAndPersistenceTests(unittest.TestCase):
             bot.state.update({
                 "cwd": "/root/repos", "model": "fable",
                 "claude_session_id": None, "codex_session_id": None,
-                "last_engine": None,
+                "last_engine": None, "manual_engine": None,
             })
 
     def _write_claude_transcript(self, session_id: str) -> None:

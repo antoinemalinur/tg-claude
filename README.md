@@ -87,6 +87,30 @@ Codex peut lui aussi tomber (quota, crédits épuisés). Dans ce cas :
   `deferred_q`) et automatiquement reprise à la prochaine fenêtre Claude, avec
   un message d'information sur Telegram. Rien n'est perdu.
 
+### La bascule manuelle : `/switch`
+
+`/switch claude` ou `/switch codex` **épingle** le moteur des prochaines tâches
+(`state["manual_engine"]`, persisté dans `state/manual-engine`). L'épingle prime
+sur le relais automatique, qui continue de tourner en dessous sans être désarmé :
+`preferred_engine` et les quotas restent suivis comme avant. `/switch auto`
+retire l'épingle.
+
+Trois points de comportement, tous couverts par les tests :
+
+- **Le contexte suit**, exactement comme pour une bascule automatique : le
+  changement de moteur déclenche `needs_handoff`, donc l'écriture de
+  `state/handoff.md`, passé au démarrage de la session entrante. Le motif inscrit
+  dans la passation indique que la bascule a été demandée à la main — le moteur
+  entrant sait qu'il prend la main sur ordre et non sur défaillance de l'autre.
+- **Un moteur épinglé mais à plat s'efface**, sans perdre l'épingle : le relais
+  assure l'intérim, et l'épingle reprend dès que le moteur choisi est réarmé.
+  Un choix explicite ne doit pas être effacé en silence par une panne de quota.
+- **L'épingle survit à un redéploiement** (comme les sessions et le `cwd`), et une
+  valeur inattendue dans le fichier est ignorée plutôt qu'imposée au routage.
+
+`/switch codex analyse ce bug` épingle *et* enchaîne sur le message, sur le
+modèle de `/opus xhigh <message>`.
+
 ---
 
 ## 3. Continuité du contexte
@@ -132,6 +156,8 @@ ne rien oublier.
 | `/help`, `/start` | aide |
 | `/status` | dossier, moteur, modèle, efforts, quotas 5 h et semaine, contexte restant, sessions, file d'attente |
 | `/pwd`, `/ls`, `/cd <chemin>` | dossier de travail (`/cd` repart sur une conversation neuve) |
+| `/switch claude\|codex [message]` | impose le moteur des prochaines tâches, avec passation du contexte; le message éventuel part aussitôt |
+| `/switch auto` | retire l'épingle et rend la main au relais automatique |
 | `/new` | remet les deux moteurs à zéro (le journal de relais est conservé) |
 | `/stop` | interrompt la tâche en cours |
 | `/model` | affiche ou change le modèle Claude |
@@ -195,7 +221,7 @@ Codex**. À revoir avant tout usage sur une machine qui compte.
 | `confirm_hook.py` | hook `PreToolUse` de confirmation des commandes dangereuses |
 | `deploy.py` | déploiement du dépôt vers la production, avec tests et retour arrière |
 | `settings.json` | réglages Claude Code utilisés par le relais (hook + permissions) |
-| `tests/test_bot.py` | 53 tests unitaires (quotas, bascule, passation, commandes) |
+| `tests/test_bot.py` | 65 tests unitaires (quotas, bascule auto et manuelle, passation, commandes) |
 
 Non versionnés (`.gitignore`) : `state/`, `logs/`, `__pycache__/`, `*.bak-*`.
 
@@ -307,7 +333,8 @@ Tout est dans `/opt/tg-claude/state/` :
 |---|---|
 | `offset` | dernier `update_id` Telegram traité (pas de message rejoué au redémarrage) |
 | `model`, `claude-effort`, `codex-effort` | préférences persistées |
-| `claude_session_id`, `codex_session_id`, `last_engine`, `cwd` | sessions natives et dossier, pour survivre à un redémarrage |
+| `claude-session-id`, `codex-session-id`, `last-engine`, `cwd` | sessions natives et dossier, pour survivre à un redémarrage |
+| `manual-engine` | moteur épinglé par `/switch` (absent = relais automatique) |
 | `relay-journal.jsonl` | journal des échanges, source du fichier de passation |
 | `handoff.md` | dernière passation générée |
 | `pending`, `decision` | dialogue avec `confirm_hook.py` |
