@@ -843,5 +843,60 @@ class MediaTests(unittest.TestCase):
         self.assertTrue(any("échoué" in call.args[0] for call in send.call_args_list))
 
 
+class SendTests(unittest.TestCase):
+    """L'envoi Telegram : rendu HTML, repli, et bascule en pièce jointe."""
+
+    def test_markdown_is_posted_as_html(self) -> None:
+        with mock.patch.object(bot, "api") as api:
+            bot.send("**gras** et `code`")
+        params = api.call_args.args[1]
+        self.assertEqual(params["parse_mode"], "HTML")
+        self.assertEqual(params["text"], "<b>gras</b> et <code>code</code>")
+
+    def test_html_refused_falls_back_to_plain_text(self) -> None:
+        # Telegram rejette le message entier sur une balise qui lui déplaît :
+        # le contenu doit partir quand même, en texte nu.
+        with mock.patch.object(bot, "api",
+                               side_effect=[RuntimeError("400"), {"ok": True}]) as api, \
+             mock.patch.object(bot, "log"):
+            bot.send("**gras**")
+        self.assertEqual(api.call_count, 2)
+        self.assertNotIn("parse_mode", api.call_args.args[1])
+        self.assertEqual(api.call_args.args[1]["text"], "gras")
+
+    def test_empty_response_is_never_silent(self) -> None:
+        with mock.patch.object(bot, "api") as api:
+            bot.send("   ")
+        self.assertIn("vide", api.call_args.args[1]["text"])
+
+    def test_very_long_answer_goes_to_a_file(self) -> None:
+        text = "phrase de remplissage assez longue. " * 500
+        with mock.patch.object(bot, "api") as api, \
+             mock.patch.object(bot, "send_document", return_value=True) as document:
+            bot.send(text)
+        self.assertEqual(api.call_count, bot.MAX_RESPONSE_CHUNKS - 1)
+        self.assertEqual(document.call_args.args[0], text)  # le texte entier
+        self.assertIn("pièce jointe", document.call_args.args[1])
+
+    def test_file_refused_falls_back_to_messages(self) -> None:
+        text = "phrase de remplissage assez longue. " * 500
+        expected = len(bot.render.render(text))
+        with mock.patch.object(bot, "api") as api, \
+             mock.patch.object(bot, "send_document", return_value=False):
+            bot.send(text)
+        self.assertEqual(api.call_count, expected)
+
+    def test_multipart_body_carries_fields_and_file(self) -> None:
+        content_type, body = bot.multipart(
+            {"chat_id": "42", "caption": "légende"}, "document", "r.txt",
+            "contenu".encode(), "text/plain")
+        boundary = content_type.split("boundary=")[1]
+        self.assertTrue(body.endswith(f"--{boundary}--\r\n".encode()))
+        self.assertIn(b'name="chat_id"\r\n\r\n42', body)
+        self.assertIn("légende".encode(), body)
+        self.assertIn(b'filename="r.txt"', body)
+        self.assertIn(b"contenu", body)
+
+
 if __name__ == "__main__":
     unittest.main()

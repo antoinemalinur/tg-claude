@@ -34,6 +34,7 @@ from typing import Any, NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import handoff as handoff_builder  # noqa: E402  (dépend du chemin ci-dessus)
+import render  # noqa: E402  (idem)
 
 BASE = "/opt/tg-claude"
 STATE_DIR = os.path.join(BASE, "state")
@@ -73,6 +74,9 @@ MESSAGE_BATCH_MAX_SECONDS = max(
     float(os.environ.get("MESSAGE_BATCH_MAX_SECONDS", "15")),
 )
 TELEGRAM_SPLIT_THRESHOLD = 3500
+# Au-delà, la réponse part aussi en pièce jointe : quatre messages d'affilée
+# dans un fil Telegram ne se relisent plus, un fichier se fait défiler.
+MAX_RESPONSE_CHUNKS = 3
 STOP_GRACE_SECONDS = 3.0
 TASK_CANCELLED = "__TG_CLAUDE_TASK_CANCELLED__"
 # Relecture du snapshot local (aucun appel réseau). La sonde Anthropic, elle,
@@ -232,14 +236,69 @@ def api(method: str, params: dict[str, Any] | None = None, timeout: int = 40) ->
         return json.load(r)
 
 
+def multipart(fields: dict[str, str], name: str, filename: str,
+              content: bytes, mime: str) -> tuple[str, bytes]:
+    """Corps multipart/form-data pour les envois de fichiers à l'API Bot."""
+    boundary = "----tgbot" + uuid.uuid4().hex
+    body = bytearray()
+    for key, value in fields.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                 f"name=\"{key}\"\r\n\r\n{value}\r\n").encode()
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+             f"filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n").encode()
+    body += content + f"\r\n--{boundary}--\r\n".encode()
+    return f"multipart/form-data; boundary={boundary}", bytes(body)
+
+
+def send_document(text: str, caption: str) -> bool:
+    """Envoie une réponse longue en pièce jointe. False si l'envoi échoue."""
+    filename = f"reponse-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+    content_type, body = multipart(
+        {"chat_id": CHAT_ID, "caption": caption},
+        "document", filename, text.encode("utf-8"), "text/plain; charset=utf-8")
+    try:
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+            data=body, headers={"Content-Type": content_type})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return bool(json.load(response).get("ok"))
+    except Exception as exc:
+        log(f"sendDocument error: {exc}")
+        return False
+
+
+def post(chunk: str) -> None:
+    """Poste un fragment en HTML, avec repli en texte brut.
+
+    Telegram rejette le message *entier* (HTTP 400) si une balise lui déplaît :
+    le repli garantit qu'un défaut de rendu ne fasse jamais perdre le contenu.
+    """
+    try:
+        api("sendMessage", {"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML",
+                            "disable_web_page_preview": "true"})
+        return
+    except Exception as exc:
+        log(f"send html error: {exc}")
+    try:
+        api("sendMessage", {"chat_id": CHAT_ID, "text": render.plain(chunk),
+                            "disable_web_page_preview": "true"})
+    except Exception as exc:  # Telegram ne doit jamais faire tomber le worker.
+        log(f"send error: {exc}")
+
+
 def send(text: str) -> None:
     text = text if text and text.strip() else "(réponse vide)"
-    for start in range(0, len(text), 4000):
-        try:
-            api("sendMessage", {"chat_id": CHAT_ID, "text": text[start:start + 4000],
-                                "disable_web_page_preview": "true"})
-        except Exception as exc:  # Telegram ne doit jamais faire tomber le worker.
-            log(f"send error: {exc}")
+    chunks = render.render(text)
+    if len(chunks) > MAX_RESPONSE_CHUNKS:
+        for chunk in chunks[:MAX_RESPONSE_CHUNKS - 1]:
+            post(chunk)
+        caption = (f"📎 Réponse longue ({len(text)} caractères) — "
+                   "texte complet en pièce jointe.")
+        if send_document(text, caption):
+            return
+        chunks = chunks[MAX_RESPONSE_CHUNKS - 1:]  # fichier refusé : on poste tout
+    for chunk in chunks:
+        post(chunk)
 
 
 def typing() -> None:

@@ -17,7 +17,7 @@ from pathlib import Path
 REPO = Path("/root/repos/tg-claude")
 PROD = Path("/opt/tg-claude")
 SERVICE = "tg-claude.service"
-FILES = ("bot.py", "handoff.py", "confirm_hook.py", "settings.json")
+FILES = ("bot.py", "handoff.py", "render.py", "confirm_hook.py", "settings.json")
 
 
 def run(*args: str) -> str:
@@ -63,7 +63,8 @@ def main() -> int:
                 shutil.copy2(PROD / name, backup / name)
         for name in FILES:
             shutil.copy2(REPO / name, PROD / name)
-        shutil.copy2(REPO / "tests" / "test_bot.py", PROD / "tests" / "test_bot.py")
+        for test in sorted((REPO / "tests").glob("test_*.py")):
+            shutil.copy2(test, PROD / "tests" / test.name)
 
         # 3. Les mêmes tests, cette fois sur le code déployé.
         run("python3", "-m", "unittest", "discover", "-s", str(PROD / "tests"), "-q")

@@ -194,10 +194,10 @@ Trois garde-fous, à comprendre avant de reprendre ce code.
 hook `PreToolUse` sur l'outil `Bash` de Claude Code. Une liste de motifs
 (`rm -rf`, `dd`, `mkfs`, `git push --force`, `git reset --hard`,
 `systemctl stop`, `DROP TABLE`, `curl … | sh`, `docker rm`, `kubectl delete`,
-fork bomb…) déclenche une demande de confirmation sur Telegram : il faut répondre
-`CONFIRME` ou `ANNULE`. Sans réponse en 5 min, la commande est **bloquée**. Le
-hook est *fail-safe* : en cas d'erreur interne sur une commande jugée dangereuse,
-il bloque.
+fork bomb…) publie une demande dans `state/pending`. **Hublot** l'affiche dans
+son interface native et écrit la décision dans `state/decision`. Sans réponse en
+5 min, la commande est **bloquée**. Le hook est *fail-safe* : en cas d'erreur
+interne sur une commande jugée dangereuse, il bloque.
 
 **3. Liste blanche d'outils** (`ALLOWED_TOOLS`) et permissions restreintes dans
 `settings.json` (côté MCP, seul `mcp__claude_ai_Gmail__create_draft` est
@@ -218,10 +218,13 @@ Codex**. À revoir avant tout usage sur une machine qui compte.
 |---|---|
 | `bot.py` | le relais : Telegram, file d'attente, routage, quotas, sessions, commandes |
 | `handoff.py` | construction du fichier de passation entre moteurs |
+| `render.py` | Markdown des moteurs → HTML Telegram, et découpe des messages longs |
 | `confirm_hook.py` | hook `PreToolUse` de confirmation des commandes dangereuses |
 | `deploy.py` | déploiement du dépôt vers la production, avec tests et retour arrière |
 | `settings.json` | réglages Claude Code utilisés par le relais (hook + permissions) |
-| `tests/test_bot.py` | 65 tests unitaires (quotas, bascule auto et manuelle, passation, commandes) |
+| `tests/test_bot.py` | 71 tests unitaires (quotas, bascule auto et manuelle, passation, commandes, envoi) |
+| `tests/test_render.py` | 26 tests de rendu et de découpe |
+| `tests/test_confirm_hook.py` | 3 tests du canal de confirmation Hublot |
 
 Non versionnés (`.gitignore`) : `state/`, `logs/`, `__pycache__/`, `*.bak-*`.
 
@@ -354,3 +357,20 @@ Tout est dans `/opt/tg-claude/state/` :
   Composio en mode clé API, sans OAuth.
 - Aucun secret n'est présent dans le dépôt : tout vient de l'environnement du
   service.
+- **Le rendu des réponses passe par `render.py`, jamais par `sendMessage` en
+  direct.** Trois règles y sont verrouillées par les tests :
+  - Telegram n'accepte que `<b> <i> <u> <s> <a> <code> <pre> <blockquote>` et
+    **rejette le message entier** (HTTP 400) sur toute autre balise : tout
+    fragment de texte est donc échappé, et `post()` renvoie le message en texte
+    nu si l'API refuse le HTML. Un défaut de rendu ne doit jamais faire perdre
+    une réponse.
+  - une coupe ne tombe qu'à une frontière de mot, **hors balise et hors
+    entité**, et les balises encore ouvertes sont refermées puis rouvertes dans
+    le fragment suivant — sinon un bloc de code de 6 000 caractères produit deux
+    messages invalides.
+  - `_italique_` n'est pas reconnu, volontairement : `horizontal_accuracy`
+    passerait en italique. Seul `*x*` l'est.
+- Au-delà de `MAX_RESPONSE_CHUNKS` fragments, la réponse part en pièce jointe
+  `.txt` (le texte **complet**, Markdown d'origine) après les deux premiers
+  messages. Si l'envoi du fichier échoue, les fragments restants sont postés :
+  aucun contenu ne disparaît.

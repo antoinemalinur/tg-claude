@@ -3,18 +3,20 @@
 
 Reçoit sur stdin le JSON du hook Claude Code. Décide :
   - commande sûre        -> exit 0 (autorisée, silencieux)
-  - commande dangereuse  -> demande CONFIRME/ANNULE sur Telegram, attend la
-                            décision (écrite par bot.py dans STATE_DIR/decision).
+  - commande dangereuse  -> publie STATE_DIR/pending pour Hublot, puis attend
+                            sa décision dans STATE_DIR/decision.
                             allow -> exit 0 ; deny/timeout -> exit 2 (bloquée).
 
 exit 2 renvoie le stderr à Claude pour qu'il sache que c'est bloqué.
 Fail-safe : en cas d'erreur sur une commande dangereuse, on BLOQUE.
 """
-import sys, os, json, re, time, urllib.parse, urllib.request
+import json
+import os
+import re
+import sys
+import time
 
 STATE_DIR = os.environ.get("TG_STATE_DIR", "/opt/tg-claude/state")
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 WAIT_SECONDS = int(os.environ.get("TG_CONFIRM_TIMEOUT", "300"))
 LOG = os.path.join(STATE_DIR, "hook.log")
 
@@ -60,19 +62,6 @@ def log(msg):
     except Exception:
         pass
 
-
-def tg_send(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        log("tg_send skipped: no token/chat_id")
-        return
-    data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode()
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15)
-    except Exception as e:
-        log(f"tg_send error: {e}")
-
-
 def main():
     try:
         data = json.load(sys.stdin)
@@ -89,6 +78,9 @@ def main():
         sys.exit(0)  # sûre -> autorisée silencieusement
 
     log(f"DANGER détecté: {cmd!r}")
+    # La décision se prend dans Hublot : le serveur ACP guette ce même
+    # fichier `pending` et la présente en natif. Telegram n'est plus le
+    # canal — le doubler enverrait une alerte que plus personne ne lit.
     os.makedirs(STATE_DIR, exist_ok=True)
     pending = os.path.join(STATE_DIR, "pending")
     decision = os.path.join(STATE_DIR, "decision")
@@ -98,11 +90,6 @@ def main():
 
     with open(pending, "w") as f:
         f.write(cmd)
-
-    tg_send("⚠️ Claude veut exécuter une commande jugée DANGEREUSE :\n\n"
-            f"{cmd}\n\n"
-            "Réponds CONFIRME pour autoriser, ANNULE pour refuser.\n"
-            f"(refus automatique dans {WAIT_SECONDS // 60} min)")
 
     deadline = time.time() + WAIT_SECONDS
     verdict = None
@@ -122,13 +109,11 @@ def main():
 
     if verdict == "allow":
         log(f"AUTORISÉ par l'utilisateur: {cmd!r}")
-        tg_send("✅ Autorisé — j'exécute.")
         sys.exit(0)
 
     reason = "Refusé par l'utilisateur" if verdict == "deny" \
         else "Aucune confirmation reçue (délai dépassé)"
     log(f"BLOQUÉ ({reason}): {cmd!r}")
-    tg_send(f"⛔ Commande bloquée — {reason}.")
     print(f"Commande bloquée par le garde-fou de sécurité : {reason}. "
           "N'exécute PAS cette commande. Propose une alternative plus sûre "
           "ou demande une instruction à l'utilisateur.", file=sys.stderr)
